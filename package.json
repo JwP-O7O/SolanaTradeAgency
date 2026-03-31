@@ -2,40 +2,24 @@
   "name": "solana-trade-agency",
   "version": "2.0.0",
   "description": "Autonomous Solana Memecoin Multi-Agent Trading Agency",
-  "main": "src/agency.js",
+  "main": "src/agency-enhanced.js",
   "scripts": {
-    "start": "node src/agency.js",
-    "paper": "MODE=paper node src/agency.js",
+    "start": "node src/agency-enhanced.js",
+    "paper": "MODE=paper node src/agency-enhanced.js",
     "backtest": "MODE=backtest node src/backtesting/engine.js",
     "dashboard": "node src/dashboard/server.js",
-    "dev": "nodemon src/agency.js"
+    "dev": "nodemon src/agency-enhanced.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.4",
     "@jup-ag/core": "^6.0.0",
-    "axios": "^1.7.9",
-    "technicalindicators": "^3.1.0",
-    "express": "^4.21.2",
-    "socket.io": "^4.8.1",
-    "winston": "^3.17.0",
-    "dotenv": "^16.4.7",
-    "node-telegram-bot-api": "^0.66.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
     "winston": "^3.11.0",
-    "winston-daily-rotate-file": "^5.0.0",
+    "node-telegram-bot-api": "^0.64.0",
     "express": "^4.18.2",
     "socket.io": "^4.7.2",
     "cors": "^2.8.5",
-    "chalk": "^4.1.2"
-    "fs-extra": "^11.3.0",
-    "chalk": "^4.1.2",
-    "node-cron": "^3.0.3",
-    "better-sqlite3": "^11.8.1",
-    "ws": "^8.18.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.9"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "events": "^3.3.0"
   }
 }
