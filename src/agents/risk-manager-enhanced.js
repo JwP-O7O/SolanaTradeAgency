@@ -1,245 +1,341 @@
-// ============================================================
+// ==================================================================
 // RISK MANAGER AGENT - ENHANCED VERSION
-// Position sizing, risk limits, portfolio protection
-// ============================================================
+// Position sizing, risk limits, portfolio protection, strategy-based
+// ==================================================================
 
 const Logger = require('../utils/logger');
+const strategies = require('../../config/strategies.json');
 
 class EnhancedRiskManagerAgent {
   constructor(state, memory) {
     this.state = state;
     this.memory = memory;
-    this.logger = Logger.create('RISK-MANAGER');
-    this.name = 'riskManager';
-    this.status = 'IDLE';
-    this.evaluationCount = 0;
-
-    // Risk configuration
-    this.config = {
-      maxPositionSizePct: 0.02, // 2% per trade
-      maxConcurrentPositions: 5,
-      dailyLossLimitPct: 0.05, // 5% daily loss limit
-      maxDrawdownPct: 0.10, // 10% max drawdown
-      defaultStopLossPct: 0.01, // 1% default stop loss
-      defaultTakeProfitPct: 0.015, // 1.5% default take profit
-      riskRewardRatio: 1.5, // Min 1:1.5 risk/reward
-      correlationThreshold: 0.7, // Max correlation between positions
+    this.logger = new Logger('RiskManager');
+    
+    // Strategy-based risk parameters
+    this.strategies = strategies;
+    
+    // Load default base parameters
+    this.baseParams = {
+      maxPositionSize: 0.01,      // 1% van portfolio per positie
+      maxDailyLoss: 0.05,          // Max 5% verlies per dag
+      maxOpenPositions: 5,
+      minRiskRewardRatio: 1.5,
+      stopLossPercent: 0.01,       // 1% stop loss
+      takeProfitPercent: 0.02,     // 2% take profit (2:1 RR)
+      trailingStopPercent: 0.005   // 0.5% trailing stop
     };
-
-    // Tracking
-    this.dailyLosses = 0;
-    this.dailyResets = [];
-    this.peakCapital = 0;
+    
+    this.dailyStats = {
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      totalPnL: 0,
+      startBalance: this.state.portfolio?.balance || 0
+    };
   }
 
-  async initialize() {
-    this.logger.info('Enhanced Risk Manager Agent initializing...');
-    this.peakCapital = this.state.portfolio.currentCapital;
-    this.status = 'READY';
-  }
-
-  async evaluate(signal, portfolio) {
-    this.status = 'EVALUATING';
-    this.evaluationCount++;
-
+  // CORE: Assess overall risk voor nieuwe trade
+  async assessRisk(signal) {
     try {
-      // Reset daily losses if new day
-      this.resetDailyLossesIfNeeded();
+      const strategyName = signal.strategy || 'MEME_MICRO_SCALP';
+      const strategy = this.strategies[strategyName];
+      
+      if (!strategy) {
+        this.logger.warn(`Strategy ${strategyName} not found, using base params`);
+        return this.assessWithBaseParams(signal);
+      }
 
-      // Run all risk checks
-      const checks = {
-        positionSize: this.checkPositionSize(portfolio),
-        dailyLossLimit: this.checkDailyLossLimit(portfolio),
-        maxDrawdown: this.checkMaxDrawdown(portfolio),
-        concurrentPositions: this.checkConcurrentPositions(portfolio),
-        correlation: this.checkCorrelation(signal, portfolio),
-        riskReward: this.checkRiskReward(signal),
-      };
+      this.logger.info(`Assessing risk for ${signal.token} using ${strategyName}`);
 
-      // Determine approval
-      const approved = Object.values(checks).every(c => c.passed);
-
-      if (!approved) {
-        const reasons = Object.entries(checks)
-          .filter(([_, c]) => !c.passed)
-          .map(([name, c]) => c.reason);
-        
-        this.logger.info(`Trade rejected: ${reasons.join(', ')}`);
-        this.status = 'IDLE';
+      // Check daily limits
+      const dailyLossCheck = this.checkDailyLoss(strategy);
+      if (!dailyLossCheck.safe) {
         return {
           approved: false,
-          reason: reasons.join('; '),
-          checks,
+          reason: 'Daily loss limit reached',
+          riskScore: 10,
+          dailyStats: this.dailyStats
         };
       }
 
-      // Calculate position parameters
-      const positionSize = this.calculatePositionSize(signal, portfolio);
-      const { stopLoss, takeProfit } = this.calculateExitLevels(signal, positionSize);
+      // Check max open positions
+      const openPositions = this.state.portfolio?.positions?.length || 0;
+      if (openPositions >= this.baseParams.maxOpenPositions) {
+        return {
+          approved: false,
+          reason: 'Max open positions reached',
+          riskScore: 9,
+          openPositions
+        };
+      }
 
-      this.status = 'IDLE';
+      // Calculate position size based on strategy
+      const positionSize = this.calculatePositionSize(signal, strategy);
+      
+      // Calculate stop loss and take profit
+      const stopLoss = this.calculateStopLoss(signal.entryPrice, strategy);
+      const takeProfit = this.calculateTakeProfit(signal.entryPrice, strategy);
+      
+      // Calculate risk/reward ratio
+      const riskReward = this.calculateRiskReward(
+        signal.entryPrice,
+        stopLoss,
+        takeProfit
+      );
+
+      // Check if R:R meets strategy minimum
+      if (riskReward < strategy.risk.minRiskRewardRatio) {
+        return {
+          approved: false,
+          reason: 'Risk/Reward ratio too low',
+          riskScore: 8,
+          riskReward,
+          minRequired: strategy.risk.minRiskRewardRatio
+        };
+      }
+
+      // Calculate overall risk score (0-10, lower = better)
+      const riskScore = this.calculateRiskScore(signal, strategy, riskReward);
+
+      // Approve if risk score is acceptable
+      const approved = riskScore <= 6;
+
       return {
-        approved: true,
+        approved,
+        reason: approved ? 'Risk acceptable' : 'Risk score too high',
+        riskScore,
         positionSize,
         stopLoss,
         takeProfit,
-        checks,
-        riskAmount: positionSize * (stopLoss / 100),
-        rewardAmount: positionSize * (takeProfit / 100),
+        riskReward,
+        strategy: strategyName,
+        params: strategy.risk,
+        dailyStats: this.dailyStats
       };
 
     } catch (error) {
-      this.logger.error('Risk evaluation error:', error.message);
-      this.status = 'ERROR';
+      this.logger.error('Risk assessment failed:', error);
       return {
         approved: false,
-        reason: 'Risk evaluation error: ' + error.message,
+        reason: 'Risk assessment error',
+        riskScore: 10,
+        error: error.message
       };
     }
   }
 
-  resetDailyLossesIfNeeded() {
-    const now = new Date();
-    const lastReset = this.dailyResets[this.dailyResets.length - 1];
+  // Fallback to base params if strategy not found
+  assessWithBaseParams(signal) {
+    const positionSize = this.baseParams.maxPositionSize;
+    const stopLoss = signal.entryPrice * (1 - this.baseParams.stopLossPercent);
+    const takeProfit = signal.entryPrice * (1 + this.baseParams.takeProfitPercent);
+    const riskReward = this.calculateRiskReward(signal.entryPrice, stopLoss, takeProfit);
     
-    if (!lastReset || new Date(lastReset).getDate() !== now.getDate()) {
-      this.dailyLosses = 0;
-      this.dailyResets.push(now);
+    return {
+      approved: riskReward >= this.baseParams.minRiskRewardRatio,
+      reason: riskReward >= this.baseParams.minRiskRewardRatio ? 'Risk acceptable (base params)' : 'R:R too low',
+      riskScore: 5,
+      positionSize,
+      stopLoss,
+      takeProfit,
+      riskReward,
+      strategy: 'BASE_PARAMS'
+    };
+  }
+
+  // Calculate position size based on strategy risk
+  calculatePositionSize(signal, strategy) {
+    const balance = this.state.portfolio?.balance || 0;
+    const maxRisk = balance * strategy.risk.maxPositionSize;
+    
+    // Account for volatility if available
+    let adjustedSize = strategy.risk.maxPositionSize;
+    
+    if (signal.volatility) {
+      // Reduce size for high volatility
+      if (signal.volatility > 0.1) {
+        adjustedSize *= 0.5; // Halveer bij hoge volatiliteit
+      }
+    }
+    
+    return Math.min(adjustedSize, this.baseParams.maxPositionSize);
+  }
+
+  // Calculate stop loss based on strategy
+  calculateStopLoss(entryPrice, strategy) {
+    return entryPrice * (1 - strategy.risk.stopLossPercent);
+  }
+
+  // Calculate take profit based on strategy
+  calculateTakeProfit(entryPrice, strategy) {
+    return entryPrice * (1 + strategy.risk.takeProfitPercent);
+  }
+
+  // Calculate risk/reward ratio
+  calculateRiskReward(entryPrice, stopLoss, takeProfit) {
+    const risk = entryPrice - stopLoss;
+    const reward = takeProfit - entryPrice;
+    return reward / risk;
+  }
+
+  // Calculate overall risk score (0-10)
+  calculateRiskScore(signal, strategy, riskReward) {
+    let score = 5; // Start neutral
+
+    // Adjust based on risk/reward
+    if (riskReward > 3) score -= 2;
+    else if (riskReward > 2) score -= 1;
+    else if (riskReward < 1.5) score += 2;
+
+    // Adjust based on signal confidence
+    if (signal.confidence) {
+      if (signal.confidence > 0.8) score -= 1;
+      else if (signal.confidence < 0.5) score += 2;
+    }
+
+    // Adjust based on sentiment
+    if (signal.sentiment) {
+      if (signal.sentiment > 0.7) score -= 1;
+      else if (signal.sentiment < 0.3) score += 1;
+    }
+
+    // Adjust based on market conditions
+    if (signal.marketCondition === 'trending') score -= 1;
+    if (signal.marketCondition === 'choppy') score += 2;
+
+    // Adjust based on daily stats
+    if (this.dailyStats.losses > this.dailyStats.wins) score += 1;
+
+    return Math.max(0, Math.min(10, score));
+  }
+
+  // Check if daily loss limit is reached
+  checkDailyLoss(strategy) {
+    const currentBalance = this.state.portfolio?.balance || 0;
+    const dailyLoss = this.dailyStats.startBalance - currentBalance;
+    const maxDailyLoss = this.dailyStats.startBalance * strategy.risk.maxDailyLoss;
+
+    return {
+      safe: dailyLoss < maxDailyLoss,
+      dailyLoss,
+      maxDailyLoss,
+      remaining: maxDailyLoss - dailyLoss
+    };
+  }
+
+  // Update daily stats after trade
+  updateDailyStats(trade) {
+    this.dailyStats.trades++;
+    
+    if (trade.pnl > 0) {
+      this.dailyStats.wins++;
+    } else {
+      this.dailyStats.losses++;
+    }
+    
+    this.dailyStats.totalPnL += trade.pnl;
+
+    this.logger.info('Daily stats updated:', {
+      winRate: (this.dailyStats.wins / this.dailyStats.trades * 100).toFixed(2) + '%',
+      totalPnL: this.dailyStats.totalPnL.toFixed(4),
+      trades: this.dailyStats.trades
+    });
+  }
+
+  // Monitor active positions and adjust stops
+  async monitorPositions() {
+    try {
+      const positions = this.state.portfolio?.positions || [];
+      
+      for (const position of positions) {
+        // Get strategy for this position
+        const strategy = this.strategies[position.strategy] || this.strategies.MEME_MICRO_SCALP;
+        
+        // Check if trailing stop should be activated
+        const currentPrice = await this.getCurrentPrice(position.token);
+        const profitPercent = (currentPrice - position.entryPrice) / position.entryPrice;
+        
+        // Activate trailing stop if profit > take profit / 2
+        if (profitPercent > (strategy.risk.takeProfitPercent / 2)) {
+          const newStopLoss = currentPrice * (1 - strategy.risk.trailingStopPercent);
+          
+          if (newStopLoss > position.stopLoss) {
+            position.stopLoss = newStopLoss;
+            this.logger.info(`Trailing stop activated for ${position.token}: ${newStopLoss}`);
+          }
+        }
+        
+        // Check if stop loss or take profit hit
+        if (currentPrice <= position.stopLoss) {
+          this.logger.warn(`Stop loss hit for ${position.token}`);
+          await this.closePosition(position, 'stop_loss');
+        } else if (currentPrice >= position.takeProfit) {
+          this.logger.info(`Take profit hit for ${position.token}`);
+          await this.closePosition(position, 'take_profit');
+        }
+      }
+      
+    } catch (error) {
+      this.logger.error('Position monitoring failed:', error);
     }
   }
 
-  checkPositionSize(portfolio) {
-    const maxSize = portfolio.currentCapital * this.config.maxPositionSizePct;
-    return {
-      passed: true,
-      maxSize,
-      reason: `Max position size: $${maxSize.toFixed(2)}`,
-    };
-  }
-
-  checkDailyLossLimit(portfolio) {
-    const dailyLimit = portfolio.initialCapital * this.config.dailyLossLimitPct;
-    const passed = this.dailyLosses < dailyLimit;
-    
-    return {
-      passed,
-      dailyLosses: this.dailyLosses,
-      dailyLimit,
-      reason: passed 
-        ? `Daily loss: $${this.dailyLosses.toFixed(2)} / $${dailyLimit.toFixed(2)}`
-        : `Daily loss limit exceeded: $${this.dailyLosses.toFixed(2)} >= $${dailyLimit.toFixed(2)}`,
-    };
-  }
-
-  checkMaxDrawdown(portfolio) {
-    const currentDrawdown = (this.peakCapital - portfolio.currentCapital) / this.peakCapital;
-    const maxDrawdown = this.config.maxDrawdownPct;
-    const passed = currentDrawdown < maxDrawdown;
-
-    if (portfolio.currentCapital > this.peakCapital) {
-      this.peakCapital = portfolio.currentCapital;
-    }
-
-    return {
-      passed,
-      currentDrawdown: (currentDrawdown * 100).toFixed(2),
-      maxDrawdown: (maxDrawdown * 100).toFixed(2),
-      reason: passed
-        ? `Drawdown: ${(currentDrawdown * 100).toFixed(2)}% / ${(maxDrawdown * 100).toFixed(2)}%`
-        : `Max drawdown exceeded: ${(currentDrawdown * 100).toFixed(2)}% >= ${(maxDrawdown * 100).toFixed(2)}%`,
-    };
-  }
-
-  checkConcurrentPositions(portfolio) {
-    const openPositions = portfolio.openPositions?.length || 0;
-    const maxPositions = this.config.maxConcurrentPositions;
-    const passed = openPositions < maxPositions;
-
-    return {
-      passed,
-      openPositions,
-      maxPositions,
-      reason: passed
-        ? `Open positions: ${openPositions} / ${maxPositions}`
-        : `Max concurrent positions exceeded: ${openPositions} >= ${maxPositions}`,
-    };
-  }
-
-  checkCorrelation(signal, portfolio) {
-    // Simplified correlation check
-    // In production: Calculate actual correlation between tokens
-    const openPositions = portfolio.openPositions || [];
-    const sameTokenPosition = openPositions.find(p => p.token === signal.token);
-    
-    const passed = !sameTokenPosition;
-
-    return {
-      passed,
-      reason: passed
-        ? 'No correlation issues'
-        : `Position already open for ${signal.symbol}`,
-    };
-  }
-
-  checkRiskReward(signal) {
-    // Risk/Reward ratio check
-    // Assuming default stop loss and take profit
-    const stopLossPct = this.config.defaultStopLossPct;
-    const takeProfitPct = this.config.defaultTakeProfitPct;
-    const ratio = takeProfitPct / stopLossPct;
-    const minRatio = this.config.riskRewardRatio;
-    const passed = ratio >= minRatio;
-
-    return {
-      passed,
-      ratio: ratio.toFixed(2),
-      minRatio: minRatio.toFixed(2),
-      reason: passed
-        ? `Risk/Reward: ${ratio.toFixed(2)} >= ${minRatio.toFixed(2)}`
-        : `Risk/Reward too low: ${ratio.toFixed(2)} < ${minRatio.toFixed(2)}`,
-    };
-  }
-
-  calculatePositionSize(signal, portfolio) {
-    const capital = portfolio.currentCapital;
-    const confidence = Math.min(signal.confidence / 100, 1); // 0-1
-    const baseSize = capital * this.config.maxPositionSizePct;
-    
-    // Scale position size by confidence
-    const scaledSize = baseSize * (0.5 + confidence * 0.5); // 50%-100% of base
-    
-    return Math.round(scaledSize * 100) / 100; // Round to 2 decimals
-  }
-
-  calculateExitLevels(signal, positionSize) {
-    // Dynamic stop loss and take profit based on volatility and confidence
-    const confidence = Math.min(signal.confidence / 100, 1);
-    
-    // Tighter stops for high confidence, wider for low confidence
-    const stopLossPct = this.config.defaultStopLossPct * (1.5 - confidence);
-    const takeProfitPct = this.config.defaultTakeProfitPct * (1 + confidence);
-
-    return {
-      stopLoss: Math.round(stopLossPct * 100) / 100,
-      takeProfit: Math.round(takeProfitPct * 100) / 100,
-    };
-  }
-
-  recordTradeLoss(pnlAmount) {
-    if (pnlAmount < 0) {
-      this.dailyLosses += Math.abs(pnlAmount);
+  // Close position
+  async closePosition(position, reason) {
+    try {
+      const currentPrice = await this.getCurrentPrice(position.token);
+      const pnl = (currentPrice - position.entryPrice) * position.size;
+      
+      this.updateDailyStats({
+        token: position.token,
+        pnl,
+        reason
+      });
+      
+      // Remove from portfolio
+      const index = this.state.portfolio.positions.indexOf(position);
+      if (index > -1) {
+        this.state.portfolio.positions.splice(index, 1);
+      }
+      
+      // Update balance
+      this.state.portfolio.balance += pnl;
+      
+      this.logger.info(`Position closed: ${position.token}, PnL: ${pnl}, Reason: ${reason}`);
+      
+      // Store in memory for learning
+      await this.memory.store('trade', {
+        token: position.token,
+        entryPrice: position.entryPrice,
+        exitPrice: currentPrice,
+        pnl,
+        reason,
+        strategy: position.strategy,
+        timestamp: Date.now()
+      });
+      
+    } catch (error) {
+      this.logger.error('Failed to close position:', error);
     }
   }
 
-  getStatus() {
-    return {
-      name: this.name,
-      status: this.status,
-      evaluationCount: this.evaluationCount,
-      dailyLosses: this.dailyLosses.toFixed(2),
-      peakCapital: this.peakCapital.toFixed(2),
-      lastUpdate: new Date().toISOString(),
+  // Get current price (placeholder - implement real price fetching)
+  async getCurrentPrice(token) {
+    // TODO: Implement real-time price fetching from DEX
+    return 0;
+  }
+
+  // Reset daily stats (call at start of each day)
+  resetDailyStats() {
+    this.dailyStats = {
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      totalPnL: 0,
+      startBalance: this.state.portfolio?.balance || 0
     };
+    this.logger.info('Daily stats reset');
   }
 }
 
