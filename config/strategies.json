@@ -1,0 +1,55 @@
+{
+  "MEME_MICRO_SCALP": {
+    "description": "Aggressive memecoin scalping based on RSI/MACD/BB/SMA and DexScreener hits",
+    "riskPerTrade": 0.01,
+    "stopLossPct": 1.0,
+    "takeProfitPct": 2.0,
+    "maxHoldMs": 180000,
+    "maxTradesPerTokenPerHour": 8,
+    "maxOpenPositionsPerToken": 3,
+    "minWinrateToTighten": 0.6,
+    "minProfitFactorToTighten": 1.8,
+    "maxDrawdownToStayAggressive": 0.12,
+    "autoTune": {
+      "enabled": true,
+      "slRange": { "min": 0.5, "max": 1.5 },
+      "tpRange": { "min": 1.0, "max": 2.5 },
+      "riskRange": { "min": 0.005, "max": 0.015 },
+      "step": {
+        "stopLossPct": 0.1,
+        "takeProfitPct": 0.2,
+        "riskPerTrade": 0.001
+      },
+      "windowTrades": 50
+    }
+  },
+
+  "SCALPING_RSI_MACD_BB_SMA": {
+    "description": "Existing scalping strategy (non-meme) with moderate risk",
+    "riskPerTrade": 0.007,
+    "stopLossPct": 1.2,
+    "takeProfitPct": 2.0,
+    "maxHoldMs": 600000,
+    "maxTradesPerTokenPerHour": 4,
+    "maxOpenPositionsPerToken": 2,
+    "minWinrateToTighten": 0.55,
+    "minProfitFactorToTighten": 1.5,
+    "maxDrawdownToStayAggressive": 0.10,
+    "autoTune": {
+      "enabled": false
+    }
+  },
+
+  "DEFAULT": {
+    "description": "Fallback strategy for unknown signal types",
+    "riskPerTrade": 0.005,
+    "stopLossPct": 1.5,
+    "takeProfitPct": 2.0,
+    "maxHoldMs": 900000,
+    "maxTradesPerTokenPerHour": 3,
+    "maxOpenPositionsPerToken": 1,
+    "autoTune": {
+      "enabled": false
+    }
+  }
+}
