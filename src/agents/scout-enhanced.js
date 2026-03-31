@@ -1,45 +1,57 @@
 // ============================================================
 // SCOUT AGENT - ENHANCED VERSION
-// Monitors: DexScreener (via DexScreenerService), Twitter/X,
-//           Telegram, Reddit, Discord
+// Monitors: DexScreener (continuous), scores tokens,
+//           emits MEMECOIN_HIT signals via SignalBus
 // ============================================================
 
 const EventEmitter = require('events');
 const Logger = require('../utils/logger');
 const DexScreenerService = require('../services/dexScreenerService');
+const { SIGNALS } = require('../services/signalBus');
+
+// ── Hit criteria (all must pass) ─────────────────────────────
+const HIT_CRITERIA = {
+  minTechnicalScore:  40,   // out of 100
+  minTotalScore:      35,   // weighted composite
+  minVolume1h:        50_000,
+  minLiquidity:       10_000,
+  minBuyRatio:        1.2,  // buys / sells
+  maxPriceChange5m:   50,   // ignore already-pumped (>50% in 5m)
+  minPriceChange5m:   1.0,  // at least 1% move in 5m
+};
 
 class EnhancedScoutAgent {
-  constructor(connection, memory) {
-    this.connection = connection;
-    this.memory = memory;
-    this.logger = Logger.create('SCOUT-ENHANCED');
-    this.name = 'scout';
-    this.status = 'IDLE';
-    this.scanCount = 0;
+  constructor(connection, memory, signalBus = null) {
+    this.connection  = connection;
+    this.memory      = memory;
+    this.bus         = signalBus;         // SignalBus (optional, but needed for hit signals)
+    this.logger      = Logger.create('SCOUT-ENHANCED');
+    this.name        = 'scout';
+    this.status      = 'IDLE';
+    this.scanCount   = 0;
 
-    // Configuration
     this.config = {
-      minVolume: 50000,
-      minLiquidity: 10000,
-      opportunityThreshold: 30,
-      socialMediaWeight: 0.3,
-      technicalWeight: 0.4,
-      onChainWeight: 0.3,
+      minVolume:             HIT_CRITERIA.minVolume1h,
+      minLiquidity:          HIT_CRITERIA.minLiquidity,
+      opportunityThreshold:  30,
+      socialMediaWeight:     0.3,
+      technicalWeight:       0.4,
+      onChainWeight:         0.3,
     };
 
-    // Data caches
-    this.watchlist = [];
-    this.opportunities = [];
-    this.socialMetrics = new Map();
+    this.watchlist      = [];
+    this.opportunities  = [];
+    this.alreadySignaled = new Set(); // token addresses already sent as HIT this session
+    this.socialMetrics  = new Map();
     this.onChainMetrics = new Map();
 
-    // — DEX Screener continuous monitoring —
+    // DEX Screener continuous monitoring
     this.dexEmitter = new EventEmitter();
     this.dexService = new DexScreenerService(this.dexEmitter);
     this._bindDexEvents();
   }
 
-  // ── DEX Screener event binding ──────────────────────────────
+  // ── DEX Screener event binding ────────────────────────────
 
   _bindDexEvents() {
     this.dexEmitter.on('dex:tokenBoostsLatest', (data) => {
@@ -51,142 +63,165 @@ class EnhancedScoutAgent {
     });
 
     this.dexEmitter.on('dex:communityTakeovers', (data) => {
-      if (Array.isArray(data) && data.length > 0) {
-        this.logger.info(`[DEX] ${data.length} community takeovers detected`);
-        data.forEach(ct => {
-          if (ct.chainId === 'solana') {
-            // Auto-watch the token pair data
-            this.dexService.addToken('solana', ct.tokenAddress);
-          }
-        });
-      }
+      if (!Array.isArray(data)) return;
+      data.filter(ct => ct.chainId === 'solana').forEach(ct => {
+        this.dexService.addToken('solana', ct.tokenAddress);
+      });
+      if (data.length) this.logger.info(`[DEX] ${data.length} community takeovers`);
     });
 
     this.dexEmitter.on('dex:tokenPairs', ({ chainId, tokenAddress, data }) => {
-      if (!data?.pairs) return;
-      const filtered = data.pairs
-        .filter(p => parseFloat(p.volume?.h1 || 0) > this.config.minVolume)
+      const pairs = data?.pairs || [];
+      const filtered = pairs
+        .filter(p => parseFloat(p.volume?.h1 || 0)    > this.config.minVolume)
         .filter(p => parseFloat(p.liquidity?.usd || 0) > this.config.minLiquidity);
-      if (filtered.length > 0) {
-        this.logger.info(`[DEX] ${filtered.length} active pairs for ${tokenAddress}`);
-        this._scoreAndMerge(filtered);
-      }
+      if (filtered.length) this._scoreAndMerge(filtered);
     });
 
     this.dexEmitter.on('dex:pair', ({ chainId, pairId, data }) => {
-      if (data?.pair) {
-        this.logger.info(`[DEX] Pair update: ${data.pair.baseToken?.symbol}/${data.pair.quoteToken?.symbol}`);
-        this._scoreAndMerge([data.pair]);
-      }
+      if (data?.pair) this._scoreAndMerge([data.pair]);
     });
 
     this.dexEmitter.on('dex:search', ({ query, data }) => {
-      if (data?.pairs?.length > 0) {
-        this.logger.info(`[DEX] Search "${query}": ${data.pairs.length} results`);
-        this._scoreAndMerge(data.pairs);
-      }
+      const pairs = data?.pairs || [];
+      if (pairs.length) this._scoreAndMerge(pairs);
     });
 
-    this.dexEmitter.on('dex:tokens', ({ chainId, tokenAddresses, data }) => {
-      if (data?.pairs?.length > 0) {
-        this._scoreAndMerge(data.pairs);
-      }
-    });
-
-    this.dexEmitter.on('dex:tokenProfiles', (data) => {
-      if (Array.isArray(data)) {
-        this.logger.info(`[DEX] ${data.length} token profiles received`);
-      }
+    this.dexEmitter.on('dex:tokens', ({ data }) => {
+      const pairs = data?.pairs || [];
+      if (pairs.length) this._scoreAndMerge(pairs);
     });
   }
 
   _handleBoostedTokens(data, source) {
     if (!Array.isArray(data)) return;
     const solana = data.filter(t => t.chainId === 'solana');
-    if (solana.length > 0) {
+    if (solana.length) {
       this.logger.info(`[DEX] ${solana.length} ${source} tokens on Solana`);
-      solana.forEach(t => {
-        this.dexService.addToken('solana', t.tokenAddress);
-      });
+      solana.forEach(t => this.dexService.addToken('solana', t.tokenAddress));
     }
   }
 
   _scoreAndMerge(pairs) {
     const mapped = pairs
       .filter(p => p.chainId === 'solana')
-      .map(pair => ({
-        token: pair.baseToken?.address,
-        symbol: pair.baseToken?.symbol,
-        name: pair.baseToken?.name,
-        price: parseFloat(pair.priceUsd || 0),
-        priceChange5m: parseFloat(pair.priceChange?.m5 || 0),
-        priceChange1h: parseFloat(pair.priceChange?.h1 || 0),
-        volume1h: parseFloat(pair.volume?.h1 || 0),
-        volume24h: parseFloat(pair.volume?.h24 || 0),
-        liquidity: parseFloat(pair.liquidity?.usd || 0),
-        txns1h: (pair.txns?.h1?.buys || 0) + (pair.txns?.h1?.sells || 0),
-        buyTxns1h: pair.txns?.h1?.buys || 0,
-        sellTxns1h: pair.txns?.h1?.sells || 0,
-        dexId: pair.dexId,
-        pairAddress: pair.pairAddress,
-        source: 'dexscreener-live',
-        technicalScore: this.calculateTechnicalScore(pair),
-        totalScore: 0,
-        timestamp: Date.now(),
-      }))
+      .map(pair => {
+        const tech = this.calculateTechnicalScore(pair);
+        const social   = this.socialMetrics.get(pair.baseToken?.address)?.average || 0;
+        const onChain  = this.onChainMetrics.get(pair.baseToken?.address)?.average || 0;
+        const total    =
+          tech    * this.config.technicalWeight +
+          social  * this.config.socialMediaWeight +
+          onChain * this.config.onChainWeight;
+
+        return {
+          token:          pair.baseToken?.address,
+          symbol:         pair.baseToken?.symbol,
+          name:           pair.baseToken?.name,
+          price:          parseFloat(pair.priceUsd || 0),
+          priceChange5m:  parseFloat(pair.priceChange?.m5 || 0),
+          priceChange1h:  parseFloat(pair.priceChange?.h1 || 0),
+          volume1h:       parseFloat(pair.volume?.h1 || 0),
+          volume24h:      parseFloat(pair.volume?.h24 || 0),
+          liquidity:      parseFloat(pair.liquidity?.usd || 0),
+          txns1h:         (pair.txns?.h1?.buys || 0) + (pair.txns?.h1?.sells || 0),
+          buyTxns1h:      pair.txns?.h1?.buys  || 0,
+          sellTxns1h:     pair.txns?.h1?.sells || 0,
+          buyRatio:       (pair.txns?.h1?.buys || 0) / Math.max(1, pair.txns?.h1?.sells || 1),
+          dexId:          pair.dexId,
+          pairAddress:    pair.pairAddress,
+          source:         'dexscreener-live',
+          technicalScore: tech,
+          socialScore:    social,
+          onChainScore:   onChain,
+          totalScore:     total,
+          timestamp:      Date.now(),
+        };
+      })
       .filter(t => t.token);
 
-    // Score with default weights (social/onchain = 0 until fetched)
+    // Upsert
     mapped.forEach(t => {
-      const social   = this.socialMetrics.get(t.token)?.average || 0;
-      const onChain  = this.onChainMetrics.get(t.token)?.average || 0;
-      t.socialScore  = social;
-      t.onChainScore = onChain;
-      t.totalScore   =
-        t.technicalScore * this.config.technicalWeight +
-        social           * this.config.socialMediaWeight +
-        onChain          * this.config.onChainWeight;
+      const idx = this.opportunities.findIndex(o => o.token === t.token);
+      if (idx >= 0) this.opportunities[idx] = t;
+      else this.opportunities.push(t);
     });
 
-    // Merge into this.opportunities (upsert by token address)
-    mapped.forEach(newOpp => {
-      const idx = this.opportunities.findIndex(o => o.token === newOpp.token);
-      if (idx >= 0) {
-        this.opportunities[idx] = newOpp;
-      } else {
-        this.opportunities.push(newOpp);
-      }
-    });
-
-    // Keep top 50 by score
+    // Keep top 50
     this.opportunities.sort((a, b) => b.totalScore - a.totalScore);
     this.opportunities = this.opportunities.slice(0, 50);
+
+    // Check for hits and signal
+    mapped.forEach(t => this._checkAndSignal(t));
   }
 
-  // ── Lifecycle ────────────────────────────────────────────────
+  // ── Hit detection & signalling ────────────────────────────
+
+  _checkAndSignal(token) {
+    if (!this.bus) return;
+    if (this.alreadySignaled.has(token.token)) return;
+
+    const c = HIT_CRITERIA;
+    const isHit =
+      token.technicalScore  >= c.minTechnicalScore  &&
+      token.totalScore      >= c.minTotalScore       &&
+      token.volume1h        >= c.minVolume1h         &&
+      token.liquidity       >= c.minLiquidity        &&
+      token.buyRatio        >= c.minBuyRatio         &&
+      token.priceChange5m   >= c.minPriceChange5m    &&
+      token.priceChange5m   <= c.maxPriceChange5m;   // not already pumped
+
+    if (isHit) {
+      this.alreadySignaled.add(token.token);
+      // Auto-expire signal lock after 10 min so same token can re-trigger
+      setTimeout(() => this.alreadySignaled.delete(token.token), 10 * 60_000);
+
+      this.logger.info(
+        `🚀 MEMECOIN HIT: ${token.symbol} | score=${token.totalScore.toFixed(1)} ` +
+        `vol1h=$${(token.volume1h / 1000).toFixed(0)}k liq=$${(token.liquidity / 1000).toFixed(0)}k ` +
+        `Δ5m=${token.priceChange5m.toFixed(2)}% buy/sell=${token.buyRatio.toFixed(2)}`
+      );
+
+      this.bus.signal(SIGNALS.MEMECOIN_HIT, {
+        token:          token.token,
+        symbol:         token.symbol,
+        name:           token.name,
+        price:          token.price,
+        priceChange5m:  token.priceChange5m,
+        priceChange1h:  token.priceChange1h,
+        volume1h:       token.volume1h,
+        liquidity:      token.liquidity,
+        buyRatio:       token.buyRatio,
+        technicalScore: token.technicalScore,
+        totalScore:     token.totalScore,
+        pairAddress:    token.pairAddress,
+        dexUrl:         `https://dexscreener.com/solana/${token.pairAddress}`,
+        source:         token.source,
+      }, 'scout');
+    }
+  }
+
+  // ── Lifecycle ──────────────────────────────────────────────
 
   async initialize() {
     this.logger.info('Enhanced Scout Agent initializing...');
     const savedWatchlist = await this.memory.get('scout_watchlist');
     if (savedWatchlist) {
       this.watchlist = savedWatchlist;
-      // Pre-populate dexService with watched tokens
       this.watchlist.forEach(t => {
-        if (t.chainId && t.tokenAddress) {
+        if (t.chainId && t.tokenAddress)
           this.dexService.addToken(t.chainId, t.tokenAddress);
-        }
       });
     }
 
-    // Default Solana search to catch new memecoins
     this.dexService.addSearchQuery('solana memecoin');
     this.dexService.addSearchQuery('solana');
-
-    // Start continuous monitoring
     this.dexService.start();
 
     this.status = 'READY';
-    this.logger.info(`Scout ready - ${this.watchlist.length} tokens on watchlist, DexScreener monitoring active`);
+    this.logger.info(
+      `Scout ready - ${this.watchlist.length} tokens on watchlist, DEX monitoring active`
+    );
   }
 
   async stop() {
@@ -197,41 +232,27 @@ class EnhancedScoutAgent {
   async scan() {
     this.status = 'SCANNING';
     this.scanCount++;
-
     try {
-      // 1. Fetch trending tokens via DexScreener (one-off for scan reports)
       const trendingTokens = await this.fetchTrendingTokens();
-
-      // 2. Parallel fetch social metrics for top 10
       const socialMetrics  = await this.fetchSocialMetrics(trendingTokens);
-
-      // 3. Fetch on-chain metrics
       const onChainMetrics = await this.fetchOnChainMetrics(trendingTokens);
+      const scored = this.scoreOpportunities(trendingTokens, socialMetrics, onChainMetrics);
 
-      // 4. Combine and score
-      const scoredTokens = this.scoreOpportunities(trendingTokens, socialMetrics, onChainMetrics);
-
-      // 5. Merge into live opportunities list
-      scoredTokens.forEach(newOpp => {
-        const idx = this.opportunities.findIndex(o => o.token === newOpp.token);
-        if (idx >= 0) {
-          this.opportunities[idx] = { ...this.opportunities[idx], ...newOpp };
-        } else {
-          this.opportunities.push(newOpp);
-        }
+      scored.forEach(t => {
+        const idx = this.opportunities.findIndex(o => o.token === t.token);
+        if (idx >= 0) this.opportunities[idx] = { ...this.opportunities[idx], ...t };
+        else this.opportunities.push(t);
+        this._checkAndSignal(t);
       });
 
-      // 6. Filter and sort
-      const filtered = this.opportunities
+      this.opportunities = this.opportunities
         .filter(t => t.totalScore > this.config.opportunityThreshold)
         .sort((a, b) => b.totalScore - a.totalScore)
         .slice(0, 50);
 
-      this.opportunities = filtered;
-      this.logger.info(`Scan #${this.scanCount}: ${filtered.length} opportunities found`);
+      this.logger.info(`Scan #${this.scanCount}: ${this.opportunities.length} opportunities`);
       this.status = 'IDLE';
-      return filtered;
-
+      return this.opportunities;
     } catch (error) {
       this.logger.error('Scout scan error:', error.message);
       this.status = 'ERROR';
@@ -239,47 +260,42 @@ class EnhancedScoutAgent {
     }
   }
 
-  // ── DEX Screener trending fetch (used in scan()) ──────────────
-
   async fetchTrendingTokens() {
     try {
-      // Use the service cache if available (populated by continuous polling)
       const cached = this.dexService.getCache('search');
       if (cached && Date.now() - cached.timestamp < 15_000) {
-        const pairs = cached.data?.data?.pairs || [];
-        return this._mapPairs(pairs);
+        return this._mapPairs(cached.data?.data?.pairs || []);
       }
-
-      // Otherwise do a direct search
       const data = await this.dexService.fetchSearch('solana');
       return this._mapPairs(data?.pairs || []);
-    } catch (error) {
-      this.logger.warn('fetchTrendingTokens error:', error.message);
+    } catch (e) {
+      this.logger.warn('fetchTrendingTokens error:', e.message);
       return [];
     }
   }
 
   _mapPairs(pairs) {
     return pairs
-      .filter(pair => pair.chainId === 'solana')
-      .filter(pair => parseFloat(pair.volume?.h1 || 0) > this.config.minVolume)
-      .filter(pair => parseFloat(pair.liquidity?.usd || 0) > this.config.minLiquidity)
+      .filter(p => p.chainId === 'solana')
+      .filter(p => parseFloat(p.volume?.h1 || 0)    > this.config.minVolume)
+      .filter(p => parseFloat(p.liquidity?.usd || 0) > this.config.minLiquidity)
       .map(pair => ({
-        token: pair.baseToken.address,
-        symbol: pair.baseToken.symbol,
-        name: pair.baseToken.name,
-        price: parseFloat(pair.priceUsd || 0),
+        token:         pair.baseToken.address,
+        symbol:        pair.baseToken.symbol,
+        name:          pair.baseToken.name,
+        price:         parseFloat(pair.priceUsd || 0),
         priceChange5m: parseFloat(pair.priceChange?.m5 || 0),
         priceChange1h: parseFloat(pair.priceChange?.h1 || 0),
-        volume1h: parseFloat(pair.volume?.h1 || 0),
-        volume24h: parseFloat(pair.volume?.h24 || 0),
-        liquidity: parseFloat(pair.liquidity?.usd || 0),
-        txns1h: (pair.txns?.h1?.buys || 0) + (pair.txns?.h1?.sells || 0),
-        buyTxns1h: pair.txns?.h1?.buys || 0,
-        sellTxns1h: pair.txns?.h1?.sells || 0,
-        dexId: pair.dexId,
-        pairAddress: pair.pairAddress,
-        source: 'dexscreener',
+        volume1h:      parseFloat(pair.volume?.h1 || 0),
+        volume24h:     parseFloat(pair.volume?.h24 || 0),
+        liquidity:     parseFloat(pair.liquidity?.usd || 0),
+        txns1h:        (pair.txns?.h1?.buys || 0) + (pair.txns?.h1?.sells || 0),
+        buyTxns1h:     pair.txns?.h1?.buys  || 0,
+        sellTxns1h:    pair.txns?.h1?.sells || 0,
+        buyRatio:      (pair.txns?.h1?.buys || 0) / Math.max(1, pair.txns?.h1?.sells || 1),
+        dexId:         pair.dexId,
+        pairAddress:   pair.pairAddress,
+        source:        'dexscreener',
         technicalScore: this.calculateTechnicalScore(pair),
       }));
   }
@@ -290,135 +306,83 @@ class EnhancedScoutAgent {
     const liq      = parseFloat(pair.liquidity?.usd || 0);
     const change5m = parseFloat(pair.priceChange?.m5 || 0);
     const change1h = parseFloat(pair.priceChange?.h1 || 0);
-    const buyRatio = (pair.txns?.h1?.buys || 0) / Math.max(1, (pair.txns?.h1?.sells || 1));
+    const buyRatio = (pair.txns?.h1?.buys || 0) / Math.max(1, pair.txns?.h1?.sells || 1);
 
     score += Math.min(vol1h    / 10000, 30);
     score += Math.min(liq      / 5000,  20);
     score += change5m > 0 ? Math.min(change5m * 2, 20) : 0;
     score += change1h > 0 ? Math.min(change1h,     15) : 0;
     score += Math.min(buyRatio * 5,     15);
-
     return Math.min(score, 100);
   }
-
-  // ── Social & on-chain metrics (unchanged) ────────────────────
 
   async fetchSocialMetrics(tokens) {
     const metrics = new Map();
     for (const token of tokens.slice(0, 10)) {
       try {
-        const twitterScore  = await this.fetchTwitterMetrics(token.symbol);
-        const telegramScore = await this.fetchTelegramMetrics(token.symbol);
-        const redditScore   = await this.fetchRedditMetrics(token.symbol);
-        const avgScore = (twitterScore + telegramScore + redditScore) / 3;
-        metrics.set(token.token, {
-          twitter: twitterScore,
-          telegram: telegramScore,
-          reddit: redditScore,
-          average: avgScore,
-          timestamp: Date.now(),
-        });
-      } catch (error) {
-        this.logger.warn(`Social metrics error for ${token.symbol}:`, error.message);
-      }
+        const t = await this.fetchTwitterMetrics(token.symbol);
+        const g = await this.fetchTelegramMetrics(token.symbol);
+        const r = await this.fetchRedditMetrics(token.symbol);
+        metrics.set(token.token, { twitter: t, telegram: g, reddit: r, average: (t + g + r) / 3, timestamp: Date.now() });
+      } catch (e) { /* skip */ }
     }
     return metrics;
   }
 
-  async fetchTwitterMetrics(symbol) {
-    const mentions    = Math.random() * 100;
-    const sentiment   = Math.random() * 100;
-    const engagement  = Math.random() * 50;
-    return Math.min((mentions + sentiment + engagement) / 3, 100);
-  }
-
-  async fetchTelegramMetrics(symbol) {
-    const groupSize   = Math.random() * 50;
-    const messageFreq = Math.random() * 30;
-    const sentiment   = Math.random() * 20;
-    return Math.min((groupSize + messageFreq + sentiment) / 3, 100);
-  }
-
-  async fetchRedditMetrics(symbol) {
-    const posts     = Math.random() * 30;
-    const upvotes   = Math.random() * 40;
-    const sentiment = Math.random() * 30;
-    return Math.min((posts + upvotes + sentiment) / 3, 100);
-  }
+  async fetchTwitterMetrics(s)  { return Math.min((Math.random()*100 + Math.random()*100 + Math.random()*50) / 3, 100); }
+  async fetchTelegramMetrics(s) { return Math.min((Math.random()*50  + Math.random()*30  + Math.random()*20) / 3, 100); }
+  async fetchRedditMetrics(s)   { return Math.min((Math.random()*30  + Math.random()*40  + Math.random()*30) / 3, 100); }
 
   async fetchOnChainMetrics(tokens) {
     const metrics = new Map();
     for (const token of tokens.slice(0, 10)) {
       try {
-        const whaleActivity       = await this.fetchWhaleActivity(token.token);
-        const walletConcentration = await this.fetchWalletConcentration(token.token);
-        const transferVolume      = await this.fetchTransferVolume(token.token);
-        const avgScore = (whaleActivity + walletConcentration + transferVolume) / 3;
-        metrics.set(token.token, {
-          whaleActivity,
-          walletConcentration,
-          transferVolume,
-          average: avgScore,
-          timestamp: Date.now(),
-        });
-      } catch (error) {
-        this.logger.warn(`On-chain metrics error for ${token.symbol}:`, error.message);
-      }
+        const w = Math.random() * 100;
+        const c = Math.random() * 100;
+        const v = Math.random() * 100;
+        metrics.set(token.token, { whaleActivity: w, walletConcentration: c, transferVolume: v, average: (w + c + v) / 3, timestamp: Date.now() });
+      } catch (e) { /* skip */ }
     }
     return metrics;
   }
 
-  async fetchWhaleActivity(tokenAddress)      { return Math.random() * 100; }
-  async fetchWalletConcentration(tokenAddress) { return Math.random() * 100; }
-  async fetchTransferVolume(tokenAddress)      { return Math.random() * 100; }
-
   scoreOpportunities(tokens, socialMetrics, onChainMetrics) {
     return tokens.map(token => {
-      const technicalScore = token.technicalScore || 0;
-      const socialScore    = socialMetrics.get(token.token)?.average || 0;
-      const onChainScore   = onChainMetrics.get(token.token)?.average || 0;
-      const totalScore     =
-        technicalScore * this.config.technicalWeight +
-        socialScore    * this.config.socialMediaWeight +
-        onChainScore   * this.config.onChainWeight;
+      const tech    = token.technicalScore || 0;
+      const social  = socialMetrics.get(token.token)?.average  || 0;
+      const onChain = onChainMetrics.get(token.token)?.average || 0;
       return {
         ...token,
-        socialScore,
-        onChainScore,
-        totalScore,
-        metrics: {
-          social:  socialMetrics.get(token.token),
-          onChain: onChainMetrics.get(token.token),
-        },
+        socialScore:  social,
+        onChainScore: onChain,
+        totalScore:   tech * this.config.technicalWeight + social * this.config.socialMediaWeight + onChain * this.config.onChainWeight,
+        metrics: { social: socialMetrics.get(token.token), onChain: onChainMetrics.get(token.token) },
       };
     });
   }
 
   generateMockOpportunities() {
-    const tokens = [
-      { symbol: 'BONK',   price: 0.000023, change: 3.5 },
-      { symbol: 'WIF',    price: 2.45,     change: 1.8 },
-      { symbol: 'POPCAT', price: 0.87,     change: 5.2 },
-    ];
-    return tokens
-      .filter(t => t.change > 0)
-      .map(t => ({
-        token: `mock_${t.symbol.toLowerCase()}`,
-        symbol: t.symbol,
-        price: t.price * (1 + (Math.random() - 0.5) * 0.02),
-        priceChange5m: t.change + (Math.random() - 0.5),
-        priceChange1h: t.change * 2,
-        volume1h: 100000 + Math.random() * 500000,
-        liquidity: 50000 + Math.random() * 200000,
-        buyTxns1h: Math.floor(50 + Math.random() * 200),
-        sellTxns1h: Math.floor(20 + Math.random() * 100),
-        technicalScore: 40 + Math.random() * 50,
-        socialScore:    30 + Math.random() * 40,
-        onChainScore:   35 + Math.random() * 45,
-        totalScore:     40 + Math.random() * 50,
-        source: 'mock',
-        isMock: true,
-      }));
+    return [
+      { symbol: 'BONK', price: 0.000023, change: 3.5 },
+      { symbol: 'WIF',  price: 2.45,     change: 1.8 },
+    ].map(t => ({
+      token: `mock_${t.symbol.toLowerCase()}`,
+      symbol: t.symbol,
+      price: t.price,
+      priceChange5m: t.change,
+      priceChange1h: t.change * 2,
+      volume1h: 150000,
+      liquidity: 75000,
+      buyTxns1h: 100,
+      sellTxns1h: 50,
+      buyRatio: 2.0,
+      technicalScore: 55,
+      socialScore: 40,
+      onChainScore: 45,
+      totalScore: 47,
+      source: 'mock',
+      isMock: true,
+    }));
   }
 
   getStatus() {
@@ -427,19 +391,17 @@ class EnhancedScoutAgent {
       status: this.status,
       scanCount: this.scanCount,
       watchlistSize: this.watchlist.length,
-      lastOpportunities: this.opportunities.length,
+      opportunities: this.opportunities.length,
+      signalsEmitted: this.alreadySignaled.size,
       dexMonitoring: {
         running:       this.dexService._running,
         watchedPairs:  this.dexService.watchedPairs.length,
         watchedTokens: this.dexService.watchedTokens.length,
         searchQueries: this.dexService.searchQueries,
-        cacheKeys:     Object.keys(this.dexService.cache),
       },
       lastUpdate: new Date().toISOString(),
     };
   }
-
-  // ── Convenience proxies to dexService ────────────────────────
 
   watchPair(chainId, pairId)          { this.dexService.addPair(chainId, pairId); }
   unwatchPair(chainId, pairId)        { this.dexService.removePair(chainId, pairId); }
