@@ -240,6 +240,71 @@ Alles wordt opgeslagen in `data/` voor backtesting.
 - Test grondig voor live trading
 - Verlies meer dan je kunt missen = BAD
 
+
+
+## 📡 Monitoring & Notifications
+
+### Telegram Bot Setup (Optioneel)
+
+Ontvang real-time notifications op je telefoon!
+
+**Stappen:**
+
+1. Open Telegram en zoek naar `@BotFather`
+2. Stuur `/newbot` en volg de instructies
+3. Kopieer de bot token
+4. Zoek naar `@userinfobot` en stuur `/start` om je chat ID te krijgen
+5. Voeg toe aan `.env`:
+
+```env
+TELEGRAM_BOT_TOKEN=your-bot-token-here
+TELEGRAM_CHAT_ID=your-chat-id-here
+```
+
+**Wat ontvang je:**
+- 🟢 Trade entries/exits met P&L
+- 🎯 High-confidence signals (>80%)
+- ⚠️ Risk alerts (drawdown, losing streaks)
+- 📈 Hourly/daily performance summaries
+- 🔴 Critical errors
+
+### Enhanced Logging
+
+De agency gebruikt Winston voor gestructureerde logs:
+
+**Log Files:**
+```
+logs/
+├── combined-YYYY-MM-DD.log    # Alle logs
+├── error-YYYY-MM-DD.log       # Alleen errors  
+├── trades-YYYY-MM-DD.log      # Trade history
+├── exceptions.log             # Uncaught exceptions
+└── rejections.log             # Unhandled promises
+```
+
+**Log Levels:**
+- `error` - Alleen fouten
+- `warn` - Waarschuwingen en errors
+- `info` - Normale operaties (default)
+- `debug` - Gedetailleerde debug info
+
+**Aanpassen:**
+```env
+LOG_LEVEL=debug  # Voor meer detail
+```
+
+**View logs:**
+```bash
+# Real-time
+tail -f logs/combined-*.log
+
+# Only trades
+tail -f logs/trades-*.log
+
+# Only errors
+tail -f logs/error-*.log
+```
+
 ---
 
 ## 🤝 Support
