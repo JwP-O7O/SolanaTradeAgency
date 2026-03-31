@@ -1,10 +1,14 @@
 // ============================================================
-// SENTIMENT AGENT - ENHANCED VERSION
-// Analyzes: Social media, on-chain metrics, community engagement
+// SENTIMENT AGENT - PHASE 1 UPGRADE  
+// LunarCrush social scores + Birdeye holder metrics
+// Vervangt random Math.random() met echte API data
 // ============================================================
 
 const axios = require('axios');
 const Logger = require('../utils/logger');
+
+const LUNARCRUSH_API_KEY = process.env.LUNARCRUSH_API_KEY || '';
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 
 class EnhancedSentimentAgent {
   constructor(memory) {
@@ -14,22 +18,20 @@ class EnhancedSentimentAgent {
     this.status = 'IDLE';
     this.analysisCount = 0;
 
-    // Configuration
     this.config = {
       twitterWeight: 0.35,
       telegramWeight: 0.25,
       redditWeight: 0.20,
       onChainWeight: 0.20,
-      sentimentThreshold: 0.3, // Reject if sentiment < 0.3
+      sentimentThreshold: 0.3,
     };
 
-    // Cache
     this.sentimentCache = new Map();
-    this.cacheExpiry = 5 * 60 * 1000; // 5 minutes
+    this.cacheExpiry = 5 * 60 * 1000;
   }
 
   async initialize() {
-    this.logger.info('Enhanced Sentiment Agent initializing...');
+    this.logger.info('Enhanced Sentiment Agent initializing (LunarCrush + Birdeye)...');
     this.status = 'READY';
   }
 
@@ -38,26 +40,25 @@ class EnhancedSentimentAgent {
     this.analysisCount++;
 
     try {
-      // Check cache first
       const cached = this.sentimentCache.get(token);
       if (cached && Date.now() - cached.timestamp < this.cacheExpiry) {
         return cached.sentiment;
       }
 
-      // Parallel fetch all sentiment sources
-      const [twitterSentiment, telegramSentiment, redditSentiment, onChainSentiment] = 
-        await Promise.all([
-          this.fetchTwitterSentiment(token),
-          this.fetchTelegramSentiment(token),
-          this.fetchRedditSentiment(token),
-          this.fetchOnChainSentiment(token),
-        ]);
+      // Parallel fetch: LunarCrush (Twitter/social) + Birdeye (on-chain)
+      const [socialSentiment, onChainSentiment] = await Promise.all([
+        this.fetchLunarCrushSentiment(token),
+        this.fetchBirdeyeOnChainMetrics(token),
+      ]);
 
-      // Weighted average
+      // Mock Telegram/Reddit voor nu (geen goedkope free API's)
+      const telegramSentiment = this.generateMockScore();
+      const redditSentiment = this.generateMockScore();
+
       const overallScore = (
-        twitterSentiment.score * this.config.twitterWeight +
-        telegramSentiment.score * this.config.telegramWeight +
-        redditSentiment.score * this.config.redditWeight +
+        socialSentiment.score * this.config.twitterWeight +
+        telegramSentiment * this.config.telegramWeight +
+        redditSentiment * this.config.redditWeight +
         onChainSentiment.score * this.config.onChainWeight
       );
 
@@ -65,23 +66,16 @@ class EnhancedSentimentAgent {
         token,
         score: overallScore,
         sources: {
-          twitter: twitterSentiment,
-          telegram: telegramSentiment,
-          reddit: redditSentiment,
+          lunarcrush: socialSentiment,
+          telegram: { score: telegramSentiment, source: 'telegram-mock' },
+          reddit: { score: redditSentiment, source: 'reddit-mock' },
           onChain: onChainSentiment,
         },
         timestamp: Date.now(),
-        analysis: this.generateAnalysis(
-          twitterSentiment,
-          telegramSentiment,
-          redditSentiment,
-          onChainSentiment
-        ),
+        analysis: this.generateAnalysis(overallScore),
       };
 
-      // Cache result
       this.sentimentCache.set(token, { sentiment, timestamp: Date.now() });
-
       this.status = 'IDLE';
       return sentiment;
 
@@ -92,138 +86,93 @@ class EnhancedSentimentAgent {
     }
   }
 
-  async fetchTwitterSentiment(token) {
+  async fetchLunarCrushSentiment(token) {
+    // LunarCrush free tier: /coins/{symbol}/meta met social scores
     try {
-      // Simulate Twitter/X API sentiment analysis
-      // In production: Use Twitter API + NLP for sentiment
-      const mentions = Math.random() * 100;
-      const sentiment = (Math.random() - 0.5) * 2; // -1 to 1
-      const engagement = Math.random() * 100;
-      const trendingScore = Math.random() * 100;
+      if (!LUNARCRUSH_API_KEY) {
+        return { score: 0.5, source: 'lunarcrush-no-key' };
+      }
 
-      const score = (sentiment + 1) / 2; // Normalize to 0-1
+      // Opmerking: LunarCrush werkt met coin symbols, niet Solana addresses
+      // Voor productie: eerst symbol resolven of CoinGecko gebruiken
+      const url = `https://lunarcrush.com/api3/coins/${token}/meta`;
+      const res = await axios.get(url, {
+        headers: { Authorization: `Bearer ${LUNARCRUSH_API_KEY}` },
+        timeout: 3000,
+      });
+
+      const data = res.data?.data;
+      if (!data) return { score: 0.5, source: 'lunarcrush-no-data' };
+
+      // Galaxy Score = overall social score 0-100, normaliseren naar 0-1
+      const galaxyScore = (data.galaxy_score || 50) / 100;
+      const altRank = data.alt_rank ? Math.max(0, 1 - data.alt_rank / 1000) : 0.5;
+      const sentiment = data.social_dominance || 0.5;
 
       return {
-        score: Math.max(0, Math.min(1, score)),
-        mentions,
-        sentiment,
-        engagement,
-        trendingScore,
-        source: 'twitter',
-        timestamp: Date.now(),
+        score: (galaxyScore * 0.5 + altRank * 0.3 + sentiment * 0.2),
+        galaxyScore,
+        altRank: data.alt_rank,
+        socialDominance: data.social_dominance,
+        source: 'lunarcrush',
       };
+
     } catch (error) {
-      this.logger.warn('Twitter sentiment error:', error.message);
-      return { score: 0.5, source: 'twitter', error: true };
+      this.logger.warn('LunarCrush fetch error:', error.message);
+      return { score: 0.5, source: 'lunarcrush-error' };
     }
   }
 
-  async fetchTelegramSentiment(token) {
+  async fetchBirdeyeOnChainMetrics(token) {
+    // Birdeye /defi/token_overview geeft holder count, whale wallet %, etc.
     try {
-      // Simulate Telegram group sentiment analysis
-      // In production: Use Telegram Bot API + message analysis
-      const groupSize = Math.random() * 100;
-      const messageFrequency = Math.random() * 100;
-      const sentiment = (Math.random() - 0.5) * 2; // -1 to 1
-      const memberGrowth = Math.random() * 100;
+      const url = `https://public-api.birdeye.so/defi/token_overview?address=${token}`;
+      const headers = BIRDEYE_API_KEY ? { 'X-API-KEY': BIRDEYE_API_KEY } : {};
+      const res = await axios.get(url, { headers, timeout: 3000 });
 
-      const score = (sentiment + 1) / 2;
+      const data = res.data?.data;
+      if (!data) return { score: 0.5, source: 'birdeye-no-data' };
+
+      // Holder count: hoe meer holders, hoe beter (max ~10k voor memecoins)
+      const holderScore = Math.min((data.holder || 100) / 10000, 1);
+
+      // Liquidity: hoe hoger, hoe veiliger (normalize tot $500k)
+      const liqScore = Math.min((data.liquidity || 10000) / 500000, 1);
+
+      // Volume 24h: activiteit indicator (normalize tot $1M)
+      const volScore = Math.min((data.v24hUSD || 50000) / 1000000, 1);
+
+      const onChainScore = holderScore * 0.4 + liqScore * 0.3 + volScore * 0.3;
 
       return {
-        score: Math.max(0, Math.min(1, score)),
-        groupSize,
-        messageFrequency,
-        sentiment,
-        memberGrowth,
-        source: 'telegram',
-        timestamp: Date.now(),
+        score: onChainScore,
+        holders: data.holder,
+        liquidity: data.liquidity,
+        volume24h: data.v24hUSD,
+        source: 'birdeye',
       };
+
     } catch (error) {
-      this.logger.warn('Telegram sentiment error:', error.message);
-      return { score: 0.5, source: 'telegram', error: true };
+      this.logger.warn('Birdeye onchain fetch error:', error.message);
+      return { score: 0.5, source: 'birdeye-error' };
     }
   }
 
-  async fetchRedditSentiment(token) {
-    try {
-      // Simulate Reddit sentiment analysis
-      // In production: Use Reddit API + NLP
-      const postCount = Math.random() * 100;
-      const upvoteRatio = Math.random();
-      const sentiment = (Math.random() - 0.5) * 2; // -1 to 1
-      const commentSentiment = (Math.random() - 0.5) * 2;
-
-      const score = (sentiment + commentSentiment) / 4 + 0.5;
-
-      return {
-        score: Math.max(0, Math.min(1, score)),
-        postCount,
-        upvoteRatio,
-        sentiment,
-        commentSentiment,
-        source: 'reddit',
-        timestamp: Date.now(),
-      };
-    } catch (error) {
-      this.logger.warn('Reddit sentiment error:', error.message);
-      return { score: 0.5, source: 'reddit', error: true };
-    }
+  generateMockScore() {
+    return 0.3 + Math.random() * 0.4; // 0.3 - 0.7
   }
 
-  async fetchOnChainSentiment(token) {
-    try {
-      // Analyze on-chain metrics for sentiment
-      // Check: whale activity, transfer volume, wallet concentration
-      const whaleActivity = Math.random() * 100;
-      const transferVolume = Math.random() * 100;
-      const walletConcentration = Math.random() * 100;
-      const largeTransfers = Math.random() * 100;
-
-      // Positive if whales are buying, negative if selling
-      const sentiment = (whaleActivity - 50) / 50;
-
-      const score = (sentiment + 1) / 2;
-
-      return {
-        score: Math.max(0, Math.min(1, score)),
-        whaleActivity,
-        transferVolume,
-        walletConcentration,
-        largeTransfers,
-        sentiment,
-        source: 'onchain',
-        timestamp: Date.now(),
-      };
-    } catch (error) {
-      this.logger.warn('On-chain sentiment error:', error.message);
-      return { score: 0.5, source: 'onchain', error: true };
-    }
-  }
-
-  generateAnalysis(twitter, telegram, reddit, onChain) {
-    const scores = [
-      twitter.score,
-      telegram.score,
-      reddit.score,
-      onChain.score,
-    ];
-
-    const avg = scores.reduce((a, b) => a + b) / scores.length;
-    const max = Math.max(...scores);
-    const min = Math.min(...scores);
-
+  generateAnalysis(overallScore) {
     let sentiment = 'NEUTRAL';
-    if (avg > 0.65) sentiment = 'VERY_POSITIVE';
-    else if (avg > 0.55) sentiment = 'POSITIVE';
-    else if (avg < 0.35) sentiment = 'VERY_NEGATIVE';
-    else if (avg < 0.45) sentiment = 'NEGATIVE';
+    if (overallScore > 0.65) sentiment = 'VERY_POSITIVE';
+    else if (overallScore > 0.55) sentiment = 'POSITIVE';
+    else if (overallScore < 0.35) sentiment = 'VERY_NEGATIVE';
+    else if (overallScore < 0.45) sentiment = 'NEGATIVE';
 
     return {
       overall: sentiment,
-      average: avg,
-      range: { min, max },
-      consensus: max - min < 0.3 ? 'HIGH' : 'LOW',
-      recommendation: avg > 0.5 ? 'CONSIDER_BUY' : 'CONSIDER_SELL',
+      average: overallScore,
+      recommendation: overallScore > 0.5 ? 'CONSIDER_BUY' : 'CONSIDER_SELL',
     };
   }
 
@@ -232,18 +181,13 @@ class EnhancedSentimentAgent {
       token,
       score: 0.5,
       sources: {
-        twitter: { score: 0.5, source: 'twitter', error: true },
-        telegram: { score: 0.5, source: 'telegram', error: true },
-        reddit: { score: 0.5, source: 'reddit', error: true },
-        onChain: { score: 0.5, source: 'onchain', error: true },
+        lunarcrush: { score: 0.5, source: 'error' },
+        telegram: { score: 0.5, source: 'telegram-mock' },
+        reddit: { score: 0.5, source: 'reddit-mock' },
+        onChain: { score: 0.5, source: 'error' },
       },
       timestamp: Date.now(),
-      analysis: {
-        overall: 'NEUTRAL',
-        average: 0.5,
-        consensus: 'LOW',
-        recommendation: 'HOLD',
-      },
+      analysis: { overall: 'NEUTRAL', average: 0.5, recommendation: 'HOLD' },
     };
   }
 
