@@ -1,317 +1,321 @@
-// ============================================================
-// SOLANA TRADE AGENCY - ENHANCED ORCHESTRATOR
-// Scout → (SignalBus: MEMECOIN_HIT) → Analyst → Risk → Execution
-// ============================================================
+// ==================================================================
+// AUTONOMOUS SOLANA TRADE AGENCY - FULLY INTEGRATED
+// Scout → Sentiment → Analyst → Risk → Execution (CONTINUOUS LOOP)
+// ==================================================================
 
-require('dotenv').config();
-const { Connection, Keypair } = require('@solana/web3.js');
-const fs   = require('fs-extra');
-const chalk = require('chalk');
-
-// Core
-const { SignalBus, SIGNALS } = require('./services/signalBus');
-const MemorySystem  = require('./memory/memorySystem');
-const Logger        = require('./utils/logger');
-
-// Enhanced agents
-const EnhancedScoutAgent    = require('./agents/scout-enhanced');
-const AnalystAgent          = require('./agents/analyst');
-const EnhancedRiskManager   = require('./agents/risk-manager-enhanced');
-const EnhancedExecutionAgent = require('./agents/execution-enhanced');
+const Logger = require('./utils/logger');
+const DexScreenerService = require('./services/dexScreenerService');
+const DataCollector = require('./services/dataCollector');
+const EnhancedScoutAgent = require('./agents/scout-enhanced');
 const EnhancedSentimentAgent = require('./agents/sentiment-enhanced');
+const EnhancedAnalystAgent = require('./agents/analyst');
+const EnhancedRiskManagerAgent = require('./agents/risk-manager-enhanced');
+const EnhancedExecutionAgent = require('./agents/execution-enhanced');
+const MemorySystem = require('./memory/memorySystem');
 
-const MODE = process.env.MODE || 'paper';
-
-class EnhancedSolanaTradeAgency {
-  constructor() {
-    this.logger  = Logger.create('AGENCY-ENHANCED');
-    this.mode    = MODE;
-    this.bus     = new SignalBus();   // ← Central signal bus
-    this.memory  = new MemorySystem();
-    this.agents  = {};
-    this.isRunning  = false;
-    this.cycleCount = 0;
-    this.startTime  = Date.now();
-
+class AutonomousTradingAgency {
+  constructor(config = {}) {
+    this.logger = new Logger('Agency');
+    this.config = {
+      mode: config.mode || 'paper', // 'paper' or 'live'
+      monitoringInterval: config.monitoringInterval || 30000, // 30s
+      minLiquidity: config.minLiquidity || 5000,
+      minVolume24h: config.minVolume24h || 10000,
+      ...config
+    };
+    
+    // Initialize services
+    this.dexScreener = new DexScreenerService();
+    this.dataCollector = new DataCollector();
+    this.memory = new MemorySystem();
+    
+    // Initialize agents
     this.state = {
-      mode: this.mode,
       portfolio: {
-        initialCapital: parseFloat(process.env.INITIAL_CAPITAL || '1000'),
-        currentCapital: parseFloat(process.env.INITIAL_CAPITAL || '1000'),
-        totalPnL: 0,
-        dailyPnL: 0,
-        openPositions: [],
-        closedTrades: [],
+        balance: 1.0, // Start with 1 SOL in paper mode
+        positions: []
+      },
+      activeSignals: [],
+      monitoringActive: false
+    };
+    
+    this.scout = new EnhancedScoutAgent(this.dexScreener);
+    this.sentiment = new EnhancedSentimentAgent();
+    this.analyst = new EnhancedAnalystAgent(this.memory);
+    this.riskManager = new EnhancedRiskManagerAgent(this.state, this.memory);
+    this.execution = new EnhancedExecutionAgent(null, null, this.config.mode);
+    
+    this.logger.info(`Agency initialized in ${this.config.mode} mode`);
+  }
+
+  // Start the autonomous trading loop
+  async start() {
+    try {
+      this.logger.info('Starting autonomous trading agency...');
+      this.state.monitoringActive = true;
+      
+      // Start data collection
+      // this.dataCollector.startCollection([], 60000);
+      
+      // Start main monitoring loop
+      await this.monitoringLoop();
+      
+    } catch (error) {
+      this.logger.error('Failed to start agency:', error);
+      throw error;
+    }
+  }
+
+  // Stop the agency
+  stop() {
+    this.logger.info('Stopping autonomous trading agency...');
+    this.state.monitoringActive = false;
+    this.dexScreener.stopMonitoring();
+    this.dataCollector.stopCollection();
+  }
+
+  // Main monitoring and trading loop
+  async monitoringLoop() {
+    const cycle = async () => {
+      if (!this.state.monitoringActive) return;
+      
+      try {
+        this.logger.info('=== Starting trading cycle ==');
+        
+        // STEP 1: Scout for opportunities
+        const candidates = await this.scout.scanMemecoins({
+          minLiquidity: this.config.minLiquidity,
+          minVolume24h: this.config.minVolume24h
+        });
+        
+        this.logger.info(`Scout found ${candidates.length} candidates`);
+        
+        // STEP 2: Process each candidate through the pipeline
+        for (const candidate of candidates) {
+          try {
+            // Sentiment analysis
+            const sentimentData = await this.sentiment.analyzeSentiment(candidate);
+            
+            if (sentimentData.score < 0.3) {
+              this.logger.info(`${candidate.tokenSymbol}: Low sentiment (${sentimentData.score}), skipping`);
+              continue;
+            }
+            
+            // Technical analysis
+            const analysis = await this.analyst.analyze({
+              ...candidate,
+              sentiment: sentimentData.score,
+              socialMetrics: sentimentData.metrics
+            });
+            
+            if (!analysis.recommendation || analysis.recommendation === 'HOLD') {
+              this.logger.info(`${candidate.tokenSymbol}: No buy signal, skipping`);
+              continue;
+            }
+            
+            // Create trading signal
+            const signal = {
+              action: analysis.recommendation,
+              token: candidate.tokenAddress,
+              tokenSymbol: candidate.tokenSymbol,
+              tokenName: candidate.tokenName,
+              entryPrice: candidate.price,
+              confidence: analysis.confidence,
+              sentiment: sentimentData.score,
+              volatility: candidate.volatility || 0.05,
+              strategy: this.selectStrategy(candidate, analysis),
+              reason: analysis.reason,
+              timestamp: Date.now()
+            };
+            
+            this.logger.info(`${signal.tokenSymbol}: Signal generated - ${signal.action} (confidence: ${signal.confidence})`);
+            
+            // STEP 3: Risk assessment
+            const riskAssessment = await this.riskManager.assessRisk(signal);
+            
+            if (!riskAssessment.approved) {
+              this.logger.warn(`${signal.tokenSymbol}: Risk rejected - ${riskAssessment.reason}`);
+              continue;
+            }
+            
+            this.logger.info(`${signal.tokenSymbol}: Risk approved (score: ${riskAssessment.riskScore})`);
+            
+            // STEP 4: Execute trade
+            const result = await this.execution.executeTrade(signal, riskAssessment);
+            
+            if (result.success) {
+              this.logger.info(`${signal.tokenSymbol}: Trade executed successfully`);
+              
+              // Update state
+              this.state.portfolio = result.portfolio || this.state.portfolio;
+              
+              // Store in memory
+              await this.memory.store('trade', {
+                signal,
+                riskAssessment,
+                result,
+                timestamp: Date.now()
+              });
+              
+              // Add to data collector watchlist
+              this.dataCollector.addToWatchlist(candidate.tokenAddress);
+            } else {
+              this.logger.error(`${signal.tokenSymbol}: Trade failed - ${result.error}`);
+            }
+            
+          } catch (error) {
+            this.logger.error(`Error processing ${candidate.tokenSymbol}:`, error.message);
+          }
+        }
+        
+        // STEP 5: Monitor existing positions
+        await this.monitorPositions();
+        
+        // STEP 6: Log cycle stats
+        this.logCycleStats();
+        
+      } catch (error) {
+        this.logger.error('Monitoring cycle failed:', error);
+      }
+      
+      // Schedule next cycle
+      if (this.state.monitoringActive) {
+        setTimeout(cycle, this.config.monitoringInterval);
+      }
+    };
+    
+    // Start first cycle
+    await cycle();
+  }
+
+  // Monitor and manage existing positions
+  async monitorPositions() {
+    try {
+      const positions = this.execution.paperPortfolio.positions.filter(p => p.status === 'open');
+      
+      if (positions.length === 0) return;
+      
+      this.logger.info(`Monitoring ${positions.length} open positions`);
+      
+      for (const position of positions) {
+        try {
+          // Get current price
+          const data = await this.dexScreener.getTokenPairs(position.token);
+          
+          if (!data.pairs || data.pairs.length === 0) continue;
+          
+          const currentPrice = parseFloat(data.pairs[0].priceUsd);
+          const pnlPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+          
+          this.logger.info(`${position.token}: Price $${currentPrice} (P&L: ${pnlPercent.toFixed(2)}%)`);
+          
+          // Check exit conditions
+          if (currentPrice <= position.stopLoss) {
+            await this.closePosition(position, currentPrice, 'stop_loss');
+          } else if (currentPrice >= position.takeProfit) {
+            await this.closePosition(position, currentPrice, 'take_profit');
+          }
+          
+        } catch (error) {
+          this.logger.error(`Failed to monitor position ${position.token}:`, error.message);
+        }
+      }
+      
+    } catch (error) {
+      this.logger.error('Position monitoring failed:', error);
+    }
+  }
+
+  // Close a position
+  async closePosition(position, exitPrice, reason) {
+    try {
+      const signal = {
+        action: 'SELL',
+        token: position.token,
+        tokenSymbol: position.tokenSymbol || position.token,
+        strategy: position.strategy,
+        exitPrice,
+        reason
+      };
+      
+      const riskAssessment = { approved: true, positionSize: 0 };
+      const result = await this.execution.executeTrade(signal, riskAssessment);
+      
+      if (result.success) {
+        const pnl = result.pnl || 0;
+        const pnlPercent = ((exitPrice - position.entryPrice) / position.entryPrice) * 100;
+        
+        this.logger.info(`Position closed: ${position.token} | P&L: ${pnl.toFixed(4)} SOL (${pnlPercent.toFixed(2)}%) | Reason: ${reason}`);
+        
+        // Update state
+        this.state.portfolio = result.portfolio || this.state.portfolio;
+        
+        // Remove from data collector
+        this.dataCollector.removeFromWatchlist(position.token);
+      }
+      
+    } catch (error) {
+      this.logger.error(`Failed to close position ${position.token}:`, error);
+    }
+  }
+
+  // Select trading strategy based on token characteristics
+  selectStrategy(candidate, analysis) {
+    // High volatility + high volume = aggressive scalping
+    if (candidate.volatility > 0.1 && candidate.volume24h > 50000) {
+      return 'MEME_MICRO_SCALP';
+    }
+    
+    // Medium volatility + momentum = swing trading
+    if (analysis.momentum > 5 && candidate.volatility > 0.05) {
+      return 'MOMENTUM_SWING';
+    }
+    
+    // Low volatility + established = conservative hold
+    return 'CONSERVATIVE_HOLD';
+  }
+
+  // Log cycle statistics
+  logCycleStats() {
+    const portfolio = this.execution.getPortfolio();
+    const pnl = this.execution.calculatePnL();
+    
+    this.logger.info('=== Cycle Stats ===');
+    this.logger.info(`Portfolio Balance: ${portfolio.balance.toFixed(4)} SOL`);
+    this.logger.info(`Open Positions: ${portfolio.openPositions}`);
+    this.logger.info(`Total Trades: ${pnl.trades}`);
+    this.logger.info(`Win Rate: ${pnl.winRate.toFixed(2)}%`);
+    this.logger.info(`Total P&L: ${pnl.total.toFixed(4)} SOL`);
+    this.logger.info('===================');
+  }
+
+  // Get agency status
+  getStatus() {
+    const portfolio = this.execution.getPortfolio();
+    const pnl = this.execution.calculatePnL();
+    const dexStats = this.dexScreener.getStats();
+    const dataStats = this.dataCollector.getStats();
+    
+    return {
+      active: this.state.monitoringActive,
+      mode: this.config.mode,
+      portfolio: {
+        balance: portfolio.balance,
+        openPositions: portfolio.openPositions,
+        totalTrades: portfolio.totalTrades
       },
       performance: {
-        totalTrades: 0, winningTrades: 0, losingTrades: 0,
-        winRate: 0, avgWin: 0, avgLoss: 0,
-        sharpeRatio: 0, maxDrawdown: 0, profitFactor: 0,
+        totalPnL: pnl.total,
+        winRate: pnl.winRate,
+        winners: pnl.winners,
+        losers: pnl.losers
       },
-      agents: {},
-      lastUpdate: new Date().toISOString(),
+      services: {
+        dexScreener: dexStats,
+        dataCollector: dataStats
+      }
     };
-  }
-
-  async initialize() {
-    this.logger.info(chalk.cyan('== SOLANA TRADE AGENCY ENHANCED OPSTARTEN =='));
-    this.logger.info(chalk.yellow(`Modus: ${this.mode.toUpperCase()}`));
-
-    this.connection = new Connection(
-      process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com',
-      'confirmed'
-    );
-
-    if (this.mode === 'live') {
-      const keyData = JSON.parse(await fs.readFile('./config/wallet.json', 'utf-8'));
-      this.wallet = Keypair.fromSecretKey(new Uint8Array(keyData));
-      this.logger.info(chalk.green(`Wallet: ${this.wallet.publicKey.toString()}`));
-    } else {
-      this.wallet = Keypair.generate();
-      this.logger.info(chalk.blue('Paper/Backtest wallet gegenereerd'));
-    }
-
-    await this.memory.initialize();
-
-    // ── Create agents, pass SignalBus to Scout ──────────────
-    this.agents.scout     = new EnhancedScoutAgent(this.connection, this.memory, this.bus);
-    this.agents.analyst   = new AnalystAgent(this.connection, this.memory);
-    this.agents.risk      = new EnhancedRiskManager(this.state, this.memory);
-    this.agents.execution = new EnhancedExecutionAgent(this.connection, this.wallet, this.mode);
-    this.agents.sentiment = new EnhancedSentimentAgent(this.memory);
-
-    for (const [name, agent] of Object.entries(this.agents)) {
-      await agent.initialize();
-      this.logger.info(chalk.green(`Agent [${name}] gereed`));
-    }
-
-    // ── Wire SignalBus listeners ────────────────────────────
-    this._wireSignalHandlers();
-
-    this.logger.info(chalk.green('== AGENCY VOLLEDIG OPERATIONEEL =='));
-    this.logger.info(chalk.cyan('SignalBus actief – Scout monitort DEX Screener continu'));
-  }
-
-  // ── Signal pipeline ──────────────────────────────────────
-
-  _wireSignalHandlers() {
-
-    // 1. Scout → Analyst: when a memecoin hit is detected
-    this.bus.on(SIGNALS.MEMECOIN_HIT, async (envelope) => {
-      const opp = envelope.payload;
-      this.logger.info(chalk.magenta(
-        `📡 SIGNAL [MEMECOIN_HIT] ${opp.symbol} score=${opp.totalScore?.toFixed(1)} ` +
-        `Δ5m=${opp.priceChange5m?.toFixed(2)}%`
-      ));
-
-      try {
-        // Step 1: Quick sentiment gate
-        const sentiment = await this.agents.sentiment.analyze(opp.token);
-        if (sentiment && sentiment.score < 0.25) {
-          this.logger.info(`Sentiment te laag voor ${opp.symbol} (${sentiment.score.toFixed(2)}) – skip`);
-          this.bus.signal(SIGNALS.ALERT, { reason: 'sentiment_too_low', token: opp.token, symbol: opp.symbol }, 'agency');
-          return;
-        }
-
-        // Step 2: Technical analysis
-        const signal = await this.agents.analyst.analyze(opp);
-        if (!signal || signal.action === 'HOLD') {
-          this.logger.info(`Analyst: HOLD voor ${opp.symbol}`);
-          return;
-        }
-
-        this.bus.signal(SIGNALS.TRADE_SIGNAL, {
-          ...signal,
-          originalHit: opp,
-        }, 'analyst');
-
-      } catch (err) {
-        this.logger.error(`Signal pipeline fout (${opp.symbol}):`, err.message);
-      }
-    });
-
-    // 2. Analyst → Risk Manager
-    this.bus.on(SIGNALS.TRADE_SIGNAL, async (envelope) => {
-      const signal = envelope.payload;
-      this.logger.info(chalk.blue(
-        `📡 SIGNAL [TRADE_SIGNAL] ${signal.symbol} ${signal.action} conf=${signal.confidence}`
-      ));
-
-      try {
-        const approval = await this.agents.risk.evaluate(signal, this.state.portfolio);
-
-        if (approval.approved) {
-          signal.positionSize = approval.positionSize;
-          signal.stopLoss     = approval.stopLoss;
-          signal.takeProfit   = approval.takeProfit;
-          this.bus.signal(SIGNALS.TRADE_APPROVED, signal, 'risk');
-        } else {
-          this.bus.signal(SIGNALS.TRADE_REJECTED, { signal, reason: approval.reason }, 'risk');
-          this.logger.info(chalk.yellow(`Risk: Afgewezen – ${approval.reason}`));
-        }
-      } catch (err) {
-        this.logger.error('Risk evaluation fout:', err.message);
-      }
-    });
-
-    // 3. Risk → Execution
-    this.bus.on(SIGNALS.TRADE_APPROVED, async (envelope) => {
-      const signal = envelope.payload;
-      this.logger.info(chalk.green(
-        `📡 SIGNAL [TRADE_APPROVED] ${signal.symbol} ${signal.action} ` +
-        `size=$${signal.positionSize} sl=${signal.stopLoss}% tp=${signal.takeProfit}%`
-      ));
-
-      try {
-        const result = await this.agents.execution.execute(signal);
-        if (result.success) {
-          this._recordTrade(signal, result);
-          await this.memory.saveTrade(signal, result);
-          this.bus.signal(SIGNALS.TRADE_EXECUTED, { signal, result }, 'execution');
-          this.logger.info(chalk.green(
-            `✅ TRADE UITGEVOERD: ${signal.symbol} ${signal.action} @ $${result.price}`
-          ));
-        }
-      } catch (err) {
-        this.logger.error('Execution fout:', err.message);
-      }
-    });
-
-    // 4. Log rejected signals
-    this.bus.on(SIGNALS.TRADE_REJECTED, (envelope) => {
-      const { signal, reason } = envelope.payload;
-      this.logger.info(chalk.yellow(`❌ Trade afgewezen: ${signal.symbol} – ${reason}`));
-    });
-
-    // 5. Log all signals to memory (catch-all)
-    this.bus.on('SIGNAL', async (envelope) => {
-      if ([SIGNALS.MEMECOIN_HIT, SIGNALS.TRADE_EXECUTED, SIGNALS.TRADE_REJECTED].includes(envelope.type)) {
-        try { await this.memory.set(`signal:${envelope.id}`, envelope); } catch (_) {}
-      }
-    });
-  }
-
-  // ── Periodic cycle: monitor open positions + update stats ─
-
-  async runCycle() {
-    this.cycleCount++;
-    try {
-      await this.monitorOpenPositions();
-      this.updatePerformanceStats();
-      this.state.lastUpdate = new Date().toISOString();
-      if (this.cycleCount % 12 === 0) { // every ~60s at 5s cycle
-        this.logger.info(
-          `Cyclus #${this.cycleCount} | Posities: ${this.state.portfolio.openPositions.length} ` +
-          `| Signals in bus: ${this.bus.history.length} | Opps: ${this.agents.scout.opportunities.length}`
-        );
-      }
-    } catch (err) {
-      this.logger.error('Cyclus fout:', err.message);
-    }
-  }
-
-  async monitorOpenPositions() {
-    const positions = this.state.portfolio.openPositions;
-    for (let i = positions.length - 1; i >= 0; i--) {
-      const pos = positions[i];
-      const currentPrice = await this.agents.analyst.getCurrentPrice(pos.token);
-      const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-
-      let shouldExit = false;
-      let exitReason = '';
-
-      if (pnlPct >= pos.takeProfitPct)                         { shouldExit = true; exitReason = 'TAKE_PROFIT'; }
-      else if (pnlPct <= -pos.stopLossPct)                     { shouldExit = true; exitReason = 'STOP_LOSS'; }
-      else if (Date.now() - pos.entryTime > pos.maxHoldMs)     { shouldExit = true; exitReason = 'MAX_HOLD_TIME'; }
-
-      if (pos.trailingStop && pnlPct > pos.trailingActivation) {
-        if (!pos.highestPrice || currentPrice > pos.highestPrice) pos.highestPrice = currentPrice;
-        if (currentPrice <= pos.highestPrice * (1 - pos.trailingDistance)) {
-          shouldExit = true; exitReason = 'TRAILING_STOP';
-        }
-      }
-
-      if (shouldExit) {
-        await this.agents.execution.closePosition(pos, currentPrice, exitReason);
-        const closed = { ...pos, exitPrice: currentPrice, exitReason, pnlPct, closedAt: Date.now() };
-        this.state.portfolio.closedTrades.push(closed);
-        positions.splice(i, 1);
-        await this.memory.saveTrade(closed, { type: 'EXIT' });
-        this.bus.signal(SIGNALS.TRADE_CLOSED, closed, 'execution');
-        this.logger.info(chalk.yellow(`Positie gesloten: ${exitReason} | PnL: ${pnlPct.toFixed(2)}%`));
-      }
-    }
-  }
-
-    // FASE 1.3: maxHoldMs uit strategy halen i.p.v. hardcoded
-  getMaxHoldMs(strategy) {
-    if (strategy === 'MEME_MICRO_SCALP') {
-      return parseInt(process.env.MICRO_MAX_HOLD_MS) || 180000; // 3 min default
-    }
-    return 15 * 60_000; // 15 min voor andere strategies
-  }
-
-  _recordTrade(signal, result) {
-    this.state.portfolio.openPositions.push({
-      id:                `T-${Date.now()}`,
-      token:             signal.token,
-      symbol:            signal.symbol,
-      action:            signal.action,
-      entryPrice:        result.price,
-      entryTime:         Date.now(),
-      positionSize:      signal.positionSize,
-      takeProfitPct:     signal.takeProfit,
-      stopLossPct:       signal.stopLoss,
-      trailingStop:      true,
-      trailingActivation: 0.8,
-      trailingDistance:  0.004,
-      maxHoldMs:       this.getMaxHoldMs(signal.strategy),      confidence:        signal.confidence,
-    });
-    this.state.performance.totalTrades++;
-  }
-
-  updatePerformanceStats() {
-    const trades = this.state.portfolio.closedTrades;
-    if (!trades.length) return;
-    const winners = trades.filter(t => t.pnlPct > 0);
-    const losers  = trades.filter(t => t.pnlPct <= 0);
-    const perf    = this.state.performance;
-    perf.winningTrades = winners.length;
-    perf.losingTrades  = losers.length;
-    perf.winRate       = (winners.length / trades.length * 100).toFixed(1);
-    perf.avgWin  = winners.length ? (winners.reduce((s, t) => s + t.pnlPct, 0) / winners.length).toFixed(2) : 0;
-    perf.avgLoss = losers.length  ? (losers.reduce((s, t)  => s + t.pnlPct, 0) / losers.length).toFixed(2)  : 0;
-    const totalPnL = trades.reduce((s, t) => s + (t.pnlPct / 100 * t.positionSize), 0);
-    this.state.portfolio.totalPnL        = totalPnL.toFixed(2);
-    this.state.portfolio.currentCapital  = (this.state.portfolio.initialCapital + totalPnL).toFixed(2);
-  }
-
-  async start() {
-    await this.initialize();
-    this.isRunning = true;
-    const intervalMs = parseInt(process.env.CYCLE_INTERVAL_MS || '5000');
-    this.logger.info(chalk.cyan(`Monitoring cyclus elke ${intervalMs / 1000}s`));
-
-    const loop = async () => {
-      if (!this.isRunning) return;
-      await this.runCycle();
-      setTimeout(loop, intervalMs);
-    };
-    loop();
-
-    process.on('SIGINT', async () => {
-      this.logger.info(chalk.red('Shutdown...'));
-      this.isRunning = false;
-      await this.agents.scout.stop();
-      await this.memory.save();
-      this.logger.info(chalk.green('Agency veilig afgesloten.'));
-      process.exit(0);
-    });
   }
 }
 
-const agency = new EnhancedSolanaTradeAgency();
-agency.start().catch(err => {
-  console.error('KRITIEKE FOUT:', err);
-  process.exit(1);
-});
+module.exports = AutonomousTradingAgency;
