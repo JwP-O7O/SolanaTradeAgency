@@ -1,9 +1,8 @@
 // ============================================================
-// ANALYST AGENT - PHASE 1 UPGRADE
+// ANALYST AGENT - PHASE 1 UPGRADE (Enhanced - SignalBus)
 // Echte OHLCV candles via Birdeye API
 // RSI/MACD/BB/SMA op echte data
 // ============================================================
-
 const TA = require('technicalindicators');
 const axios = require('axios');
 const Logger = require('../utils/logger');
@@ -11,14 +10,14 @@ const Logger = require('../utils/logger');
 const BIRDEYE_BASE_URL = 'https://public-api.birdeye.so';
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || ''; // Free tier: 100 req/min
 
-class AnalystAgent {
-  constructor(connection, memory) {
+class EnhancedAnalystAgent {
+  constructor(connection, memory, bus) {
     this.connection = connection;
     this.memory = memory;
+    this.bus = bus;
     this.logger = Logger.create('ANALYST');
     this.name = 'analyst';
     this.status = 'IDLE';
-
     this.config = {
       rsiPeriod: 14,
       rsiOversold: 25,
@@ -31,7 +30,6 @@ class AnalystAgent {
       smaPeriod10: 10,
       smaPeriod20: 20,
     };
-
     this.priceCache = {};
   }
 
@@ -49,7 +47,6 @@ class AnalystAgent {
         this.logger.warn(`Onvoldoende candles voor ${opportunity.symbol}`);
         return null;
       }
-
       const closes = candles.map(c => c.close);
       const highs = candles.map(c => c.high);
       const lows = candles.map(c => c.low);
@@ -131,22 +128,17 @@ class AnalystAgent {
 
   async fetchCandles(token, timeframe, limit) {
     if (token.startsWith('mock_')) return this.generateMockCandles(limit);
-
     try {
       // Birdeye OHLCV endpoint: /defi/ohlcv?address=TOKEN&type=1m&time_from=X&time_to=Y
       const now = Math.floor(Date.now() / 1000);
       const timeFrom = now - (limit * 60); // 100 candles * 60 sec
-
       const url = `${BIRDEYE_BASE_URL}/defi/ohlcv?address=${token}&type=1m&time_from=${timeFrom}&time_to=${now}`;
       const headers = BIRDEYE_API_KEY ? { 'X-API-KEY': BIRDEYE_API_KEY } : {};
-
       const res = await axios.get(url, { headers, timeout: 5000 });
-
       if (!res.data?.data?.items || res.data.data.items.length < 50) {
         this.logger.warn(`Birdeye returned insufficient candles for ${token}, fallback to mock`);
         return this.generateMockCandles(limit);
       }
-
       // Map Birdeye OHLCV format
       return res.data.data.items.map(c => ({
         open: c.o,
@@ -156,7 +148,6 @@ class AnalystAgent {
         volume: c.v,
         time: c.unixTime * 1000, // convert to ms
       })).reverse(); // Birdeye retourneert nieuw->oud, we willen oud->nieuw
-
     } catch (error) {
       this.logger.warn(`Birdeye fetch error for ${token}:`, error.message);
       return this.generateMockCandles(limit);
@@ -184,7 +175,6 @@ class AnalystAgent {
 
   async getCurrentPrice(token) {
     if (token.startsWith('mock_')) return 0.001 * (1 + (Math.random() - 0.5) * 0.02);
-
     try {
       const url = `${BIRDEYE_BASE_URL}/defi/price?address=${token}`;
       const headers = BIRDEYE_API_KEY ? { 'X-API-KEY': BIRDEYE_API_KEY } : {};
@@ -201,4 +191,4 @@ class AnalystAgent {
   }
 }
 
-module.exports = AnalystAgent;
+module.exports = EnhancedAnalystAgent;
