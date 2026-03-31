@@ -1,233 +1,326 @@
-// ============================================================
-// DEX SCREENER SERVICE - Continuous Monitoring
-// Covers all public DEX Screener API endpoints
-// Rate limit: 60 req/min per endpoint
-// ============================================================
+// ==================================================================
+// DEX SCREENER SERVICE - ENHANCED WITH REAL-TIME MONITORING
+// Continuous monitoring, rate limiting, data caching
+// ==================================================================
 
 const axios = require('axios');
-
-const BASE_URL = 'https://api.dexscreener.com';
-
-// Interval presets (ms) – stay well below 60 req/min limit
-const INTERVALS = {
-  tokenProfiles:     60_000,  //  1x / min
-  communityTakeovers: 60_000,
-  ads:               60_000,
-  tokenBoostsLatest: 30_000,  //  2x / min
-  tokenBoostsTop:    30_000,
-  pairs:             10_000,  //  6x / min  (per watched pair)
-  search:            15_000,
-  tokenPairs:        15_000,
-  tokens:            15_000,
-};
+const Logger = require('../utils/logger');
 
 class DexScreenerService {
-  constructor(eventEmitter) {
-    this.emitter    = eventEmitter; // pass an EventEmitter to subscribe to updates
-    this.timers     = {};
-    this.cache      = {};           // last known data per endpoint
-    this.watchedPairs   = [];       // [{ chainId, pairId }]
-    this.watchedTokens  = [];       // [{ chainId, tokenAddress }]
-    this.searchQueries  = [];       // strings
-    this._running   = false;
+  constructor() {
+    this.baseUrl = 'https://api.dexscreener.com/latest/dex';
+    this.logger = new Logger('DexScreener');
+    
+    // Rate limiting: 60 req/min per endpoint (300 total/min)
+    this.rateLimit = {
+      requestsPerMinute: 60,
+      requestsMade: 0,
+      windowStart: Date.now()
+    };
+    
+    // Cache for reducing API calls
+    this.cache = new Map();
+    this.cacheTimeout = 10000; // 10 seconds
+    
+    // Monitoring state
+    this.monitoringActive = false;
+    this.watchlist = new Set();
   }
 
-  // ── Public API ──────────────────────────────────────────────
-
-  /** Start all polling loops */
-  start() {
-    if (this._running) return;
-    this._running = true;
-
-    this._poll('tokenProfiles',      () => this.fetchTokenProfiles());
-    this._poll('communityTakeovers', () => this.fetchCommunityTakeovers());
-    this._poll('ads',                () => this.fetchAds());
-    this._poll('tokenBoostsLatest',  () => this.fetchTokenBoostsLatest());
-    this._poll('tokenBoostsTop',     () => this.fetchTokenBoostsTop());
-    this._poll('search',             () => this.pollSearchQueries());
-    this._poll('tokenPairs',         () => this.pollTokenPairs());
-    this._poll('tokens',             () => this.pollTokens());
-    this._poll('pairs',              () => this.pollPairs());
-
-    console.log('[DexScreener] Continuous monitoring started');
-  }
-
-  /** Stop all polling loops */
-  stop() {
-    Object.values(this.timers).forEach(clearInterval);
-    this.timers  = {};
-    this._running = false;
-    console.log('[DexScreener] Monitoring stopped');
-  }
-
-  /** Watch a specific trading pair */
-  addPair(chainId, pairId) {
-    if (!this.watchedPairs.find(p => p.chainId === chainId && p.pairId === pairId)) {
-      this.watchedPairs.push({ chainId, pairId });
+  // Check rate limit before making request
+  async checkRateLimit() {
+    const now = Date.now();
+    const elapsed = now - this.rateLimit.windowStart;
+    
+    // Reset counter every minute
+    if (elapsed >= 60000) {
+      this.rateLimit.requestsMade = 0;
+      this.rateLimit.windowStart = now;
     }
-  }
-
-  removePair(chainId, pairId) {
-    this.watchedPairs = this.watchedPairs.filter(
-      p => !(p.chainId === chainId && p.pairId === pairId)
-    );
-  }
-
-  /** Watch a token address for pair data */
-  addToken(chainId, tokenAddress) {
-    if (!this.watchedTokens.find(t => t.chainId === chainId && t.tokenAddress === tokenAddress)) {
-      this.watchedTokens.push({ chainId, tokenAddress });
+    
+    // Wait if limit exceeded
+    if (this.rateLimit.requestsMade >= this.rateLimit.requestsPerMinute) {
+      const waitTime = 60000 - elapsed;
+      this.logger.warn(`Rate limit reached, waiting ${waitTime}ms`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      this.rateLimit.requestsMade = 0;
+      this.rateLimit.windowStart = Date.now();
     }
+    
+    this.rateLimit.requestsMade++;
   }
 
-  removeToken(chainId, tokenAddress) {
-    this.watchedTokens = this.watchedTokens.filter(
-      t => !(t.chainId === chainId && t.tokenAddress === tokenAddress)
-    );
-  }
-
-  /** Add a search query to poll */
-  addSearchQuery(query) {
-    if (!this.searchQueries.includes(query)) this.searchQueries.push(query);
-  }
-
-  /** Get cached data snapshot */
-  getCache(key) {
-    return this.cache[key] ?? null;
-  }
-
-  // ── Fetch helpers ────────────────────────────────────────────
-
-  async fetchTokenProfiles() {
-    const data = await this._get('/token-profiles/latest/v1');
-    this._emit('tokenProfiles', data);
-    return data;
-  }
-
-  async fetchCommunityTakeovers() {
-    const data = await this._get('/community-takeovers/latest/v1');
-    this._emit('communityTakeovers', data);
-    return data;
-  }
-
-  async fetchAds() {
-    const data = await this._get('/ads/latest/v1');
-    this._emit('ads', data);
-    return data;
-  }
-
-  async fetchTokenBoostsLatest() {
-    const data = await this._get('/token-boosts/latest/v1');
-    this._emit('tokenBoostsLatest', data);
-    return data;
-  }
-
-  async fetchTokenBoostsTop() {
-    const data = await this._get('/token-boosts/top/v1');
-    this._emit('tokenBoostsTop', data);
-    return data;
-  }
-
-  async fetchOrders(chainId, tokenAddress) {
-    const data = await this._get(`/orders/v1/${chainId}/${tokenAddress}`);
-    this._emit('orders', { chainId, tokenAddress, data });
-    return data;
-  }
-
-  async fetchPair(chainId, pairId) {
-    const data = await this._get(`/latest/dex/pairs/${chainId}/${pairId}`);
-    this._emit('pair', { chainId, pairId, data });
-    return data;
-  }
-
-  async fetchSearch(query) {
-    const data = await this._get('/latest/dex/search', { q: query });
-    this._emit('search', { query, data });
-    return data;
-  }
-
-  async fetchTokenPairs(chainId, tokenAddress) {
-    const data = await this._get(`/token-pairs/v1/${chainId}/${tokenAddress}`);
-    this._emit('tokenPairs', { chainId, tokenAddress, data });
-    return data;
-  }
-
-  async fetchTokens(chainId, tokenAddresses) {
-    // tokenAddresses is a comma-separated string or array
-    const addresses = Array.isArray(tokenAddresses)
-      ? tokenAddresses.join(',')
-      : tokenAddresses;
-    const data = await this._get(`/tokens/v1/${chainId}/${addresses}`);
-    this._emit('tokens', { chainId, tokenAddresses: addresses, data });
-    return data;
-  }
-
-  // ── Poll group handlers ──────────────────────────────────────
-
-  async pollPairs() {
-    for (const { chainId, pairId } of this.watchedPairs) {
-      await this.fetchPair(chainId, pairId);
+  // Get cached data or fetch new
+  async getCached(key, fetchFunction) {
+    const cached = this.cache.get(key);
+    
+    if (cached && (Date.now() - cached.timestamp) < this.cacheTimeout) {
+      return cached.data;
     }
-  }
-
-  async pollTokenPairs() {
-    for (const { chainId, tokenAddress } of this.watchedTokens) {
-      await this.fetchTokenPairs(chainId, tokenAddress);
-    }
-  }
-
-  async pollTokens() {
-    if (this.watchedTokens.length === 0) return;
-    // Group by chainId, max 30 addresses per request
-    const byChain = {};
-    for (const { chainId, tokenAddress } of this.watchedTokens) {
-      (byChain[chainId] = byChain[chainId] || []).push(tokenAddress);
-    }
-    for (const [chainId, addresses] of Object.entries(byChain)) {
-      const chunks = this._chunk(addresses, 30);
-      for (const chunk of chunks) {
-        await this.fetchTokens(chainId, chunk);
-      }
-    }
-  }
-
-  async pollSearchQueries() {
-    for (const query of this.searchQueries) {
-      await this.fetchSearch(query);
-    }
-  }
-
-  // ── Internal helpers ─────────────────────────────────────────
-
-  _poll(name, fn) {
-    const interval = INTERVALS[name] ?? 60_000;
-    // Run immediately, then on interval
-    fn().catch(e => console.error(`[DexScreener] ${name} error:`, e.message));
-    this.timers[name] = setInterval(() => {
-      fn().catch(e => console.error(`[DexScreener] ${name} error:`, e.message));
-    }, interval);
-  }
-
-  _emit(event, data) {
-    this.cache[event] = { data, timestamp: Date.now() };
-    if (this.emitter) this.emitter.emit(`dex:${event}`, data);
-  }
-
-  async _get(path, params = {}) {
-    const response = await axios.get(`${BASE_URL}${path}`, {
-      params,
-      timeout: 8000,
-      headers: { 'Accept': 'application/json' },
+    
+    const data = await fetchFunction();
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now()
     });
-    return response.data;
+    
+    return data;
   }
 
-  _chunk(arr, size) {
-    const result = [];
-    for (let i = 0; i < arr.length; i += size) {
-      result.push(arr.slice(i, i + size));
+  // Search for tokens
+  async searchTokens(query) {
+    try {
+      await this.checkRateLimit();
+      
+      const response = await axios.get(`${this.baseUrl}/search`, {
+        params: { q: query },
+        timeout: 10000
+      });
+      
+      this.logger.info(`Search results for "${query}": ${response.data.pairs?.length || 0} pairs found`);
+      return response.data;
+      
+    } catch (error) {
+      this.logger.error('Search failed:', error.message);
+      return { pairs: [] };
     }
-    return result;
+  }
+
+  // Get token pairs by addresses
+  async getTokenPairs(addresses) {
+    try {
+      await this.checkRateLimit();
+      
+      const addressList = Array.isArray(addresses) ? addresses.join(',') : addresses;
+      const cacheKey = `pairs_${addressList}`;
+      
+      return await this.getCached(cacheKey, async () => {
+        const response = await axios.get(`${this.baseUrl}/tokens/${addressList}`, {
+          timeout: 10000
+        });
+        
+        this.logger.info(`Fetched ${response.data.pairs?.length || 0} pairs`);
+        return response.data;
+      });
+      
+    } catch (error) {
+      this.logger.error('Failed to fetch token pairs:', error.message);
+      return { pairs: [] };
+    }
+  }
+
+  // Get pair by address
+  async getPair(pairAddress) {
+    try {
+      await this.checkRateLimit();
+      
+      const cacheKey = `pair_${pairAddress}`;
+      
+      return await this.getCached(cacheKey, async () => {
+        const response = await axios.get(`${this.baseUrl}/pairs/${pairAddress}`, {
+          timeout: 10000
+        });
+        
+        return response.data;
+      });
+      
+    } catch (error) {
+      this.logger.error('Failed to fetch pair:', error.message);
+      return null;
+    }
+  }
+
+  // Get latest token profiles (boosted tokens)
+  async getLatestProfiles() {
+    try {
+      await this.checkRateLimit();
+      
+      const response = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', {
+        timeout: 10000
+      });
+      
+      this.logger.info(`Fetched ${response.data.length || 0} latest profiles`);
+      return response.data;
+      
+    } catch (error) {
+      this.logger.error('Failed to fetch latest profiles:', error.message);
+      return [];
+    }
+  }
+
+  // Get top boosted tokens
+  async getTopBoosted() {
+    try {
+      await this.checkRateLimit();
+      
+      const response = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', {
+        timeout: 10000
+      });
+      
+      this.logger.info(`Fetched ${response.data.length || 0} top boosted tokens`);
+      return response.data;
+      
+    } catch (error) {
+      this.logger.error('Failed to fetch top boosted:', error.message);
+      return [];
+    }
+  }
+
+  // Scan for new Solana memecoins
+  async scanNewMemecoins(minLiquidity = 5000, minVolume24h = 10000) {
+    try {
+      this.logger.info('Scanning for new Solana memecoins...');
+      
+      // Get latest profiles (these are typically new/boosted tokens)
+      const profiles = await this.getLatestProfiles();
+      
+      // Filter for Solana tokens
+      const solanaProfiles = profiles.filter(p => 
+        p.chainId === 'solana' || p.url?.includes('solana')
+      );
+      
+      // Get detailed data for each token
+      const candidates = [];
+      
+      for (const profile of solanaProfiles.slice(0, 10)) { // Limit to avoid rate limits
+        try {
+          const tokenData = await this.getTokenPairs(profile.tokenAddress);
+          
+          if (tokenData.pairs && tokenData.pairs.length > 0) {
+            for (const pair of tokenData.pairs) {
+              // Filter by criteria
+              if (pair.chainId === 'solana' &&
+                  pair.liquidity?.usd >= minLiquidity &&
+                  pair.volume?.h24 >= minVolume24h) {
+                
+                candidates.push({
+                  tokenAddress: pair.baseToken.address,
+                  tokenName: pair.baseToken.name,
+                  tokenSymbol: pair.baseToken.symbol,
+                  pairAddress: pair.pairAddress,
+                  dex: pair.dexId,
+                  price: pair.priceUsd,
+                  liquidity: pair.liquidity?.usd || 0,
+                  volume24h: pair.volume?.h24 || 0,
+                  priceChange24h: pair.priceChange?.h24 || 0,
+                  priceChange1h: pair.priceChange?.h1 || 0,
+                  txns24h: pair.txns?.h24 || {},
+                  marketCap: pair.fdv || 0,
+                  timestamp: Date.now()
+                });
+              }
+            }
+          }
+        } catch (error) {
+          this.logger.warn(`Failed to fetch data for ${profile.tokenAddress}:`, error.message);
+        }
+      }
+      
+      this.logger.info(`Found ${candidates.length} memecoin candidates`);
+      return candidates;
+      
+    } catch (error) {
+      this.logger.error('Memecoin scan failed:', error.message);
+      return [];
+    }
+  }
+
+  // Add token to watchlist
+  addToWatchlist(tokenAddress) {
+    this.watchlist.add(tokenAddress);
+    this.logger.info(`Added ${tokenAddress} to watchlist (${this.watchlist.size} tokens)`);
+  }
+
+  // Remove from watchlist
+  removeFromWatchlist(tokenAddress) {
+    this.watchlist.delete(tokenAddress);
+    this.logger.info(`Removed ${tokenAddress} from watchlist`);
+  }
+
+  // Monitor watchlist tokens
+  async monitorWatchlist() {
+    if (this.watchlist.size === 0) {
+      return [];
+    }
+    
+    try {
+      const addresses = Array.from(this.watchlist);
+      const data = await this.getTokenPairs(addresses);
+      
+      return data.pairs || [];
+      
+    } catch (error) {
+      this.logger.error('Watchlist monitoring failed:', error.message);
+      return [];
+    }
+  }
+
+  // Start continuous monitoring
+  startMonitoring(callback, interval = 30000) {
+    if (this.monitoringActive) {
+      this.logger.warn('Monitoring already active');
+      return;
+    }
+    
+    this.monitoringActive = true;
+    this.logger.info(`Started monitoring (interval: ${interval}ms)`);
+    
+    const monitor = async () => {
+      if (!this.monitoringActive) return;
+      
+      try {
+        // Scan for new memecoins
+        const candidates = await this.scanNewMemecoins();
+        
+        // Monitor watchlist
+        const watchlistData = await this.monitorWatchlist();
+        
+        // Callback with data
+        if (callback) {
+          await callback({
+            newCandidates: candidates,
+            watchlist: watchlistData,
+            timestamp: Date.now()
+          });
+        }
+        
+      } catch (error) {
+        this.logger.error('Monitoring cycle failed:', error);
+      }
+      
+      // Schedule next cycle
+      if (this.monitoringActive) {
+        setTimeout(monitor, interval);
+      }
+    };
+    
+    // Start first cycle
+    monitor();
+  }
+
+  // Stop monitoring
+  stopMonitoring() {
+    this.monitoringActive = false;
+    this.logger.info('Stopped monitoring');
+  }
+
+  // Get monitoring stats
+  getStats() {
+    return {
+      rateLimit: {
+        requestsMade: this.rateLimit.requestsMade,
+        requestsPerMinute: this.rateLimit.requestsPerMinute,
+        windowStart: this.rateLimit.windowStart
+      },
+      cache: {
+        size: this.cache.size,
+        timeout: this.cacheTimeout
+      },
+      monitoring: {
+        active: this.monitoringActive,
+        watchlistSize: this.watchlist.size
+      }
+    };
   }
 }
 
