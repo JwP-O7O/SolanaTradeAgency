@@ -243,6 +243,14 @@ class EnhancedSolanaTradeAgency {
     }
   }
 
+    // FASE 1.3: maxHoldMs uit strategy halen i.p.v. hardcoded
+  getMaxHoldMs(strategy) {
+    if (strategy === 'MEME_MICRO_SCALP') {
+      return parseInt(process.env.MICRO_MAX_HOLD_MS) || 180000; // 3 min default
+    }
+    return 15 * 60_000; // 15 min voor andere strategies
+  }
+
   _recordTrade(signal, result) {
     this.state.portfolio.openPositions.push({
       id:                `T-${Date.now()}`,
@@ -254,12 +262,10 @@ class EnhancedSolanaTradeAgency {
       positionSize:      signal.positionSize,
       takeProfitPct:     signal.takeProfit,
       stopLossPct:       signal.stopLoss,
-      maxHoldMs:         15 * 60_000,
       trailingStop:      true,
       trailingActivation: 0.8,
       trailingDistance:  0.004,
-      strategy:          signal.strategy,
-      confidence:        signal.confidence,
+      maxHoldMs:       this.getMaxHoldMs(signal.strategy),      confidence:        signal.confidence,
     });
     this.state.performance.totalTrades++;
   }
